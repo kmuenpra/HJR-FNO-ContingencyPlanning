@@ -25,6 +25,7 @@ class Utils:
         self.obs_circle = self.env.obs_circle
         self.obs_rectangle = self.env.obs_rectangle
         self.obs_boundary = self.env.obs_boundary
+        self.unknown_obs_circle = self.env.unknown_obs_circle
 
     def update_obs(self, obs_cir, obs_bound, obs_rec):
         self.obs_circle = obs_cir
@@ -87,23 +88,26 @@ class Utils:
             return True
 
         o, d = self.get_ray(start, end)
-        obs_vertex = self.get_obs_vertex()
+        # obs_vertex = self.get_obs_vertex()
 
-        for (v1, v2, v3, v4) in obs_vertex:
-            if self.is_intersect_rec(start, end, o, d, v1, v2):
-                return True
-            if self.is_intersect_rec(start, end, o, d, v2, v3):
-                return True
-            if self.is_intersect_rec(start, end, o, d, v3, v4):
-                return True
-            if self.is_intersect_rec(start, end, o, d, v4, v1):
-                return True
+        # for (v1, v2, v3, v4) in obs_vertex:
+        #     if self.is_intersect_rec(start, end, o, d, v1, v2):
+        #         return True
+        #     if self.is_intersect_rec(start, end, o, d, v2, v3):
+        #         return True
+        #     if self.is_intersect_rec(start, end, o, d, v3, v4):
+        #         return True
+        #     if self.is_intersect_rec(start, end, o, d, v4, v1):
+        #         return True
 
         for (x, y, r) in self.obs_circle:
             if self.is_intersect_circle(o, d, [x, y], r):
                 return True
 
         return False
+    
+    def inside_reachable_sets(self, HJB_set):
+        raise NotImplemented
 
     def is_inside_obs(self, node):
         delta = self.delta
@@ -112,10 +116,10 @@ class Utils:
             if math.hypot(node.x - x, node.y - y) <= r + delta:
                 return True
 
-        for (x, y, w, h) in self.obs_rectangle:
-            if 0 <= node.x - (x - delta) <= w + 2 * delta \
-                    and 0 <= node.y - (y - delta) <= h + 2 * delta:
-                return True
+        # for (x, y, w, h) in self.obs_rectangle:
+        #     if 0 <= node.x - (x - delta) <= w + 2 * delta \
+        #             and 0 <= node.y - (y - delta) <= h + 2 * delta:
+        #         return True
 
         for (x, y, w, h) in self.obs_boundary:
             if 0 <= node.x - (x - delta) <= w + 2 * delta \
@@ -145,3 +149,77 @@ class Utils:
         dx = node_end.x - node_start.x
         dy = node_end.y - node_start.y
         return math.hypot(dx, dy), math.atan2(dy, dx)
+    
+    @staticmethod
+    def wrap_angle(theta):
+        #Wrap angle to domain [-pi, pi]
+        return (theta + math.pi) % (2 * math.pi) - math.pi 
+
+    @staticmethod
+    def update_robot_position_dubins(state, dest, dt, v=1.0, w_max=1):
+        """
+        Dubins car update with bounded angular velocity.
+
+        state  = [x, y, theta]
+        dest = [x_d, y_d]
+        """
+
+        x, y, theta = state
+        dx = dest[0] - x
+        dy = dest[1] - y
+
+        desired_theta = math.atan2(dy, dx)
+        heading_error = Utils.wrap_angle(desired_theta - theta)
+
+        omega = max(-w_max, min(w_max, heading_error / dt))
+
+        theta_new = Utils.wrap_angle(theta + omega * dt)
+        x_new = x + v * dt * math.cos(theta_new)
+        y_new = y + v * dt * math.sin(theta_new)
+
+        return [x_new, y_new, theta_new % (2 * math.pi)] #return theta in domain [0, 2pi]
+        
+    
+    def lidar_detected(self, robot_position, sensing_radius=2.0):
+        """
+        @description 
+        Simulate a circular lidar sensor. 
+        The obstacle is detected when the obstacle center lies in a thin annulus around the sensing boundary 
+        
+        Detection rule:
+        An obstacle is detected when the obstacle center lies within
+        |d - sensing_radius| <= r_i / 3.
+        
+        @params 
+        - robot_position : (x, y) "Current robot position" 
+        - sensing_radius : float "Lidar sensing radius" 
+        
+        @return 
+        - self.unknown_obs_circle: list "Remaining Unknown obstacles (for plotting)"
+        - detected_obstacles : list "Obstacles that satisfy the detection condition"
+        """
+
+        if not self.unknown_obs_circle:
+            return [], []
+
+        obs = np.asarray(self.unknown_obs_circle, dtype=float)
+        x_r, y_r = robot_position
+
+        # Distance to obstacle centers
+        d = np.sqrt((obs[:, 0] - x_r)**2 + (obs[:, 1] - y_r)**2)
+
+        # Detection condition
+        detected_mask = np.abs(d - sensing_radius) <= (obs[:, 2] / 3.0)
+
+        if not np.any(detected_mask):
+            return self.unknown_obs_circle, []
+
+        # Split detected vs remaining in ONE operation
+        detected_obstacles = obs[detected_mask].tolist()
+        remaining_obstacles = obs[~detected_mask].tolist()
+
+        # Update unknown obstacle list
+        self.unknown_obs_circle = remaining_obstacles
+
+        return self.unknown_obs_circle, detected_obstacles
+

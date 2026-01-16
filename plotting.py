@@ -7,6 +7,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import os
 import sys
+import numpy as np
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) +
                 "/../../Sampling_based_Planning/")
@@ -16,12 +17,14 @@ import env
 
 
 class Plotting:
-    def __init__(self, x_start, x_goal):
+    def __init__(self, x_start, x_goal, safe_regions=[]):
         self.xI, self.xG = x_start, x_goal
-        self.env = env.Env()
+        self.env = env.Env(safe_regions=safe_regions)
         self.obs_bound = self.env.obs_boundary
         self.obs_circle = self.env.obs_circle
         self.obs_rectangle = self.env.obs_rectangle
+        self.unknown_obs_circle = self.env.unknown_obs_circle
+        self.safe_regions = self.env.safe_regions
 
     def animation(self, nodelist, path, name, animation=False):
         self.plot_grid(name)
@@ -72,17 +75,22 @@ class Plotting:
         plt.title(name)
         plt.axis("equal")
 
-    def plot_env(self, ax):
-        # goal
-        goal_patch = patches.Circle(
-            (self.xG[0], self.xG[1]), 0.5,
-            edgecolor='red',
-            facecolor='red',
-            fill=True
-        )
+    def plot_env(self, ax, colorList=None):
         
-        ax.add_patch(goal_patch)
-        ax.draw_artist(goal_patch)
+        if colorList is None:
+            colorList = ['red' for _ in range(len(self.xG))]
+            
+        for i, xG_i in enumerate(self.xG):
+            # goal
+            goal_patch = patches.Circle(
+                (xG_i[0], xG_i[1]), 1,
+                edgecolor=colorList[i],
+                facecolor=colorList[i],
+                fill=True
+            )
+            
+            ax.add_patch(goal_patch)
+            ax.draw_artist(goal_patch)
 
         # boundary obstacles
         for (ox, oy, w, h) in self.obs_bound:
@@ -116,8 +124,32 @@ class Plotting:
             )
             ax.add_patch(circle_patch)
             ax.draw_artist(circle_patch)
+            
+        # unknown obstacles
+        for (ox, oy, r) in self.unknown_obs_circle:
+            circle_patch = patches.Circle(
+                (ox, oy), r,
+                edgecolor='red',
+                facecolor='none',
+                linestyle='--',
+            )
+            ax.add_patch(circle_patch)
+            ax.draw_artist(circle_patch)
+            
+        if self.safe_regions:
+            for (ox, oy, r) in self.safe_regions:
+                circle_patch = patches.Circle(
+                    (ox, oy), r,
+                    edgecolor='green',
+                    facecolor='none',
+                    linewidth = 3,
+                )
+                ax.add_patch(circle_patch)
+                ax.draw_artist(circle_patch)
 
-    def plot_robot(self, ax, robot_position):
+
+    def plot_robot(self, ax, robot_position, lidar_range=2.0):
+        #robot
         start_patch = patches.Circle(
             (robot_position[0], robot_position[1]), 0.5,
             edgecolor='green',
@@ -126,11 +158,46 @@ class Plotting:
         )
         ax.add_patch(start_patch)
         ax.draw_artist(start_patch)
+        
+        #lidar
+        lidar_patch = patches.Circle(
+        (robot_position[0], robot_position[1]),
+        radius=lidar_range,
+        edgecolor='green',
+        facecolor='none',
+        linestyle='--',
+        linewidth=1.5,
+        alpha=0.8,
+        zorder=4
+        )
+        ax.add_patch(lidar_patch)
+        ax.draw_artist(lidar_patch)
+        
+    
+    def plot_reachable_set(self, ax, hjr_fno, theta_slice, time_slice):
+        
+        
+        for i in range(hjr_fno.num_safe_regions):
+            reachable_set = hjr_fno.HJR_sets[i].detach().cpu().numpy()
+            
+            reachable_set_slice = reachable_set[...,theta_slice, time_slice]
+            
+            CS = ax.contour(
+                hjr_fno.X + hjr_fno.safe_regions[i][0],
+                hjr_fno.Y + hjr_fno.safe_regions[i][1],
+                reachable_set_slice,
+                levels=[0],
+                colors='magenta',
+                linewidths=2
+            )
+        
+    
 
-    def update_obs(self, obs_cir, obs_bound, obs_rec):
+    def update_obs(self, obs_cir, obs_bound, obs_rec, unknown_obs):
         self.obs_bound = obs_bound
         self.obs_circle = obs_cir
         self.obs_rectangle = obs_rec
+        self.unknown_obs_circle = unknown_obs
 
     @staticmethod
     def plot_visited(nodelist, animation):
