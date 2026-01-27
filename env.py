@@ -6,8 +6,8 @@ Environment for rrt_2D
 
 class Env:
     def __init__(self, safe_regions=[]):
-        self.x_range = (-30, 30)
-        self.y_range = (-30, 30)
+        self.x_range = (-25, 25)
+        self.y_range = (-25, 25)
         self.obs_boundary = self.obs_boundary()
         self.obs_circle = self.obs_circle()
         self.obs_rectangle = self.obs_rectangle()
@@ -61,7 +61,7 @@ class Env:
         [ 10.0,  -12.0, 1.8],
         [ 14.0,   2.0, 1.5],
         [  6.0,  16.0, 1.6],
-        [ -4.0,   9.0, 1.3],
+        [ -11.0,   10.0, 1.5],
         [ -14.0,  3.0, 1.7],
         [ -16.0, -4.0, 1.5],
         [ -9.0,  16.0, 1.8],

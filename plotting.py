@@ -80,18 +80,17 @@ class Plotting:
         if colorList is None:
             colorList = ['red' for _ in range(len(self.xG))]
             
+        #plot_goals
         for i, xG_i in enumerate(self.xG):
-            # goal
-            goal_patch = patches.Circle(
-                (xG_i[0], xG_i[1]), 1,
-                edgecolor=colorList[i],
-                facecolor=colorList[i],
-                fill=True
-            )
-            
-            ax.add_patch(goal_patch)
-            ax.draw_artist(goal_patch)
-
+                ax.scatter(
+                    xG_i[0], xG_i[1],
+                    marker='*',
+                    s=300,                    # size (adjust as needed)
+                    c=[colorList[i]],         # face color
+                    edgecolors='black',       # outline color
+                    linewidths=1.5,
+                    zorder=10
+                )
         # boundary obstacles
         for (ox, oy, w, h) in self.obs_bound:
             boundary_patch = patches.Rectangle(

@@ -18,19 +18,20 @@ from rrtx import Node
 
 
 class Utils:
-    def __init__(self):
-        self.env = env.Env()
+    def __init__(self, environment:env.Env):
+        self.env = environment
 
-        self.delta = 0.5
+        self.delta = 0.1
         self.obs_circle = self.env.obs_circle
         self.obs_rectangle = self.env.obs_rectangle
         self.obs_boundary = self.env.obs_boundary
         self.unknown_obs_circle = self.env.unknown_obs_circle
 
-    def update_obs(self, obs_cir, obs_bound, obs_rec):
+    def update_obs(self, obs_cir, obs_bound, obs_rec, unknown_obs_cir):
         self.obs_circle = obs_cir
         self.obs_boundary = obs_bound
         self.obs_rectangle = obs_rec
+        self.unknown_obs_circle = unknown_obs_cir
 
     def get_obs_vertex(self):
         delta = self.delta
@@ -68,9 +69,26 @@ class Utils:
         return False
 
     def is_intersect_circle(self, o, d, a, r):
-        d2 = np.dot(d, d)
+        
+        
         delta = self.delta
+        
+        ox, oy = o #starting node 
+        dx, dy = d #direction vector
+        cx, cy = a #circle center
 
+        # Endpoint 1 inside circle
+        if (ox - cx)**2 + (oy - cy)**2 <= (r + delta)**2:
+            return True
+
+        # Endpoint 2 inside circle
+        ex, ey = ox + dx, oy + dy
+        if (ex - cx)**2 + (ey - cy)**2 <= (r + delta)**2:
+            return True
+        
+        #Projection of circle center onto the ray
+        d2 = np.dot(d, d)
+        
         if d2 == 0:
             return False
 

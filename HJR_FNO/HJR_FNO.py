@@ -26,6 +26,8 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from pathlib import Path
 
+from scipy.interpolate import RegularGridInterpolator
+
 #---------------------
 # 1D Fourier Neural Operator Class
 #---------------------
@@ -329,8 +331,8 @@ class HJR_FNO:
         # (since training data assume the safe region locates at the origin)
         self.num_safe_regions = len(safe_regions)
         self.safe_regions = safe_regions
-        self.obs_SDF = [ np.full((self.N[0], self.N[1], self.N[2]), np.nan) for i in range(self.num_safe_regions)]
-    
+        self.obs_SDF = [ self.shapeCylinder(ignoreDims=[2], center=np.array([-10,-10,0]), radius=1.0) for i in range(self.num_safe_regions)]
+        self.obs_list = [ [] for i in range(self.num_safe_regions)] #store all obstacles seen so far for each safe region
         
         # Params for mapping spatial coordiantes to matrix indices
         self.env_extent = [self.grid_min[0], self.grid_max[0], self.grid_min[1], self.grid_max[1]]
@@ -366,7 +368,7 @@ class HJR_FNO:
         # self.feasible_set = np.column_stack((np.empty(0), np.empty(0)))
         
         HJR_set_init = self.predict(
-            sdf_input=self.shapeCylinder(ignoreDims=[2], center=np.array([-10,-10,0]), radius=1.0), 
+            sdf_input=self.obs_SDF[0], 
              # TODO Need to retrain HJR-FNO for the case where there are no obstacles, what does the reachable set look like???
              # TODO Technically, we can just solve for the reachable set, pre-planning
             theta_hyparam=self.theta_array, 
@@ -567,23 +569,33 @@ class HJR_FNO:
         for i in range(self.num_safe_regions):
             x_offset, y_offset , _ = self.safe_regions[i]
             
+            update_HJR_set = False 
+            
             for obs in obs_cir:
                 x,y,r = obs
                 
-                #Create signed distance field in the local frame
-                obs_sdf = self.shapeCylinder(ignoreDims=[2], center=np.array([x - x_offset, y - y_offset, 0]), radius=r)
+                center = np.array([x - x_offset, y - y_offset, 0])
+                within_bound = np.all(center >= self.grid_min) and np.all(center <= self.grid_max)
                 
-                #Union of all observed obstacles
-                if np.isnan(self.obs_SDF[i]).all():
-                    self.obs_SDF[i] = obs_sdf
-                else:
-                    self.obs_SDF[i] = np.minimum(self.obs_SDF[i], obs_sdf)
+                if within_bound: #only care about signed distance field within the grid range of the reachable set
                     
-            #Predict HJRNO reachable set (again)
-            # (Nx, Ny, Ntheta, Nt)
-            self.HJR_sets[i] = self.predict(sdf_input=self.obs_SDF[i], theta_hyparam=self.theta_array, time_hyparam=self.time_array)
+                    #Need to update reachable set
+                    update_HJR_set = True
+                
+                    #Create signed distance field in the local frame
+                    obs_sdf = self.shapeCylinder(ignoreDims=[2], center=center, radius=r)
+                    
+                    #Union of all observed obstacles
+                    self.obs_SDF[i] = np.minimum(self.obs_SDF[i], obs_sdf)
+                    self.obs_list[i].append(obs) #store the newly detected obstacle
+                    
+            #if new obstacle lies within the grid range of the reachable set, we need to update the reachable set
+            if update_HJR_set:
+                #Predict HJRNO reachable set (again)
+                # (Nx, Ny, Ntheta, Nt)
+                self.HJR_sets[i] = self.predict(sdf_input=self.obs_SDF[i], theta_hyparam=self.theta_array, time_hyparam=self.time_array)
             
-        #Update feasible region for sampling
+        #Update feasible region (find miminal set with respect to all theta slices) for RRT planning
         for i, reach_i in enumerate(self.HJR_sets):
             self.feasible_region[i] = np.max(reach_i[...,self.Tf_slice].cpu().numpy(), axis=2)
             
@@ -649,6 +661,39 @@ class HJR_FNO:
         
         return False
         
+    '''
+    For Contingency Planning toward safe region
+    '''
+    
+    # def compute_hjb_gradients(self):
+    #     """
+    #     Compute spatial derivatives of V(x,y,theta) at a fixed time slice.
+
+    #     V: (Nx, Ny, Ntheta) ndarray
+    #     Returns: dVdx, dVdy, dVdtheta
+    #     """
+        
+        
+    #     self.N = np.array([50, 50, 25]) #Dimension for [x,y,theta] ;  original (50,50,25)
+
+    #     self.g = Grid(
+    #         self.grid_min,
+    #         self.grid_max,
+    #         self.dims,
+    #         self.N,
+    #         self.pd
+    #     )
+        
+    #     dx = self.g.dx[0]
+    #     dy = self.g.dx[1]
+    #     dtheta = self.g.dx[2]
+        
+    #     dVdx, dVdy, dVdtheta = np.gradient(
+    #         V, dx, dy, dtheta, edge_order=2
+    #     )
+
+    #     return dVdx, dVdy, dVdtheta
+
         
             
 
