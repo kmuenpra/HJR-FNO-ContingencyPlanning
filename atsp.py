@@ -275,39 +275,82 @@ class SA:
 
 def held_karp(
     cost: List[List[float]],
-    prefix: List[int],  # e.g. [0,3,2]
+    prefix: List[int],              # e.g. [0, 3, 2]
+    hamiltonian_cycle: bool = True  # if False → Hamiltonian path
 ) -> Tuple[float, List[int]]:
+    """
+    Held–Karp DP with forced prefix.
+    Supports both Hamiltonian cycle (TSP) and Hamiltonian path.
+
+    Parameters
+    ----------
+    cost : List[List[float]]
+        n x n cost matrix.
+
+    prefix : List[int]
+        Forced sequence of visited nodes.
+
+    hamiltonian_cycle : bool
+        If True, return a Hamiltonian cycle (return to start).
+        If False, return a Hamiltonian path (do NOT return).
+
+    Returns
+    -------
+    total_cost : float
+        Optimal total cost including prefix.
+
+    tour : List[int]
+        Optimal Hamiltonian path or cycle.
+    """
+
+    # ------------------------------------------------------------
+    # 1. Extract start and current node
+    # ------------------------------------------------------------
 
     start = prefix[0]
     current = prefix[-1]
 
-    # cost of forced prefix
+    # ------------------------------------------------------------
+    # 2. Cost of forced prefix
+    # ------------------------------------------------------------
+
     prefix_cost = 0.0
     for i in range(len(prefix) - 1):
         prefix_cost += cost[prefix[i]][prefix[i + 1]]
 
-    n = len(cost)
+    # ------------------------------------------------------------
+    # 3. Remaining nodes
+    # ------------------------------------------------------------
 
+    n = len(cost)
     visited = set(prefix)
     nodes = [i for i in range(n) if i not in visited]
 
-    # DP[(subset, j)] = min cost to start at `current`, visit subset, end at j
+    # ------------------------------------------------------------
+    # 4. DP tables
+    # ------------------------------------------------------------
+
     DP: Dict[Tuple[Tuple[int, ...], int], float] = {}
     parent: Dict[Tuple[Tuple[int, ...], int], int] = {}
 
-    # ------------------
-    # Base cases
-    # ------------------
+    INF = float("inf")
+
+    # ------------------------------------------------------------
+    # 5. Base cases (|S| = 1)
+    # ------------------------------------------------------------
+
     for j in nodes:
         DP[((j,), j)] = cost[current][j]
         parent[((j,), j)] = current
 
-    # ------------------
-    # Build DP
-    # ------------------
+    # ------------------------------------------------------------
+    # 6. Build DP for |S| ≥ 2
+    # ------------------------------------------------------------
+
     for size in range(2, len(nodes) + 1):
         for subset in combinations(nodes, size):
             subset = tuple(sorted(subset))
+
             for j in subset:
                 prev_subset = tuple(x for x in subset if x != j)
 
@@ -328,9 +371,10 @@ def held_karp(
                     DP[(subset, j)] = best_cost
                     parent[(subset, j)] = best_prev
 
-    # ------------------
-    # Close cycle back to start
-    # ------------------
+    # ------------------------------------------------------------
+    # 7. Termination: cycle vs path
+    # ------------------------------------------------------------
+
     full_subset = tuple(sorted(nodes))
     min_cost = INF
     last_node = None
@@ -340,7 +384,13 @@ def held_karp(
         if key not in DP:
             continue
 
-        c = DP[key] + cost[j][start]
+        # Cycle: add return-to-start edge
+        if hamiltonian_cycle:
+            c = DP[key] + cost[j][start]
+        # Path: stop at j
+        else:
+            c = DP[key]
+
         if c < min_cost:
             min_cost = c
             last_node = j
@@ -348,9 +398,10 @@ def held_karp(
     if last_node is None:
         return INF, []
 
-    # ------------------
-    # Reconstruct remainder
-    # ------------------
+    # ------------------------------------------------------------
+    # 8. Reconstruct remainder
+    # ------------------------------------------------------------
+
     remainder = []
     subset = full_subset
     j = last_node
@@ -363,7 +414,15 @@ def held_karp(
 
     remainder.reverse()
 
-    full_tour = prefix + remainder + [start]
+    # ------------------------------------------------------------
+    # 9. Assemble final tour
+    # ------------------------------------------------------------
+
+    if hamiltonian_cycle:
+        tour = prefix + remainder + [start]
+    else:
+        tour = prefix + remainder
+
     total_cost = prefix_cost + min_cost
 
-    return total_cost, full_tour
+    return total_cost, tour

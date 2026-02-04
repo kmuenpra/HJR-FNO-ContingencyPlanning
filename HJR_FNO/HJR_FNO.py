@@ -1,32 +1,53 @@
-import numpy as np
+# =========================
+# Standard library imports
+# =========================
+import os
+import time
+import math
+import operator
+import warnings
+from functools import reduce, partial
+from timeit import default_timer
+from pathlib import Path
+from typing import Tuple, List, Dict, Union
 
+warnings.filterwarnings("ignore")
+
+# =========================
+# Third-party imports
+# =========================
+import numpy as np
+import matplotlib.pyplot as plt
+from tqdm import tqdm
+from scipy.io import loadmat
+from scipy.interpolate import RegularGridInterpolator
+from matplotlib.animation import FuncAnimation, PillowWriter
+from matplotlib.figure import Figure
+from matplotlib.axes import Axes
+
+# =========================
+# PyTorch imports
+# =========================
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.nn.parameter import Parameter
+from torch.utils.data import DataLoader, TensorDataset
 
-import operator
-from functools import reduce
-from functools import partial
-from timeit import default_timer
+# =========================
+# Local / project imports
+# =========================
+from .neural_utils import *
+# import utils
+# import plotting
 
-from utils import *
 
+# =========================
+# Reproducibility
+# =========================
 torch.manual_seed(0)
 np.random.seed(0)
 
-import math
-from typing import List, Union
-import warnings
-
-import os
-from tqdm import tqdm
-import math
-from torch.utils.data import DataLoader, TensorDataset
-
-from pathlib import Path
-
-from scipy.interpolate import RegularGridInterpolator
 
 #---------------------
 # 1D Fourier Neural Operator Class
@@ -55,7 +76,7 @@ class SpectralConv1d(nn.Module):
         batchsize = x.shape[0]
         #Compute Fourier coeffcients up to factor of e^(- something constant)
         x_ft = torch.fft.rfft(x)
-
+                
         # Multiply relevant Fourier modes
         out_ft = torch.zeros(batchsize, self.out_channels, x.size(-1)//2 + 1,  device=x.device, dtype=torch.cfloat)
         out_ft[:, :, :self.modes1] = self.compl_mul1d(x_ft[:, :, :self.modes1], self.weights1)
@@ -83,7 +104,7 @@ class FNO1d(nn.Module):
 
         self.modes1 = modes
         self.width = width
-        
+                
         self.lifting = nn.Conv1d(5, self.width, 1)
         self.projection = nn.Conv1d(self.width, 1, 1)
 
@@ -133,147 +154,245 @@ class FNO1d(nn.Module):
 
         return x
 
-#---------------------
-# Grid Class 
-#---------------------
+#---------------------------------------
+# Grid structure for HJB computation
+#---------------------------------------
 
 class Grid:
-    def __init__(
-        self,
-        minBounds: List,
-        maxBounds: List,
-        dims: int,
-        pts_each_dim: List,
-        periodicDims: List = [],
-    ):
-        """
-        Args:
-            minBounds (list): The lower bounds of each dimension in the grid
-            maxBounds (list): The upper bounds of each dimension in the grid
-            dims (int): The dimension of grid
-            pts_each_dim (list): The number of points for each dimension in the grid
-            periodicDim (list, optional): A list of periodic dimentions (0-indexed). Defaults to [].
-        """
-        assert len(minBounds) == len(maxBounds) == len(pts_each_dim) == dims
-
-        self.max = np.array(maxBounds)
-        self.min = np.array(minBounds)
-        self.dims = dims
-        self.pts_each_dim = np.array(pts_each_dim)
-        self.pDim = periodicDims
-
-        # Exclude the upper bounds for periodic dimensions is not included
-        # e.g. [-pi, pi)
-        for dim in self.pDim:
-            self.max[dim] = self.min[dim] + (self.max[dim] - self.min[dim]) * (
-                1 - 1 / self.pts_each_dim[dim]
-            )
-        self.dx = (self.max - self.min) / (self.pts_each_dim - 1.0)
-
-        """
-        Below is re-shaping the self.vs so that we can make use of broadcasting
-        self.vs[i] is reshape into (1,1, ... , pts_each_dim[i], ..., 1) such that pts_each_dim[i] is used in ith position
-        """
+    def __init__(self, min_vals, max_vals, N, periodic_dims=None):
+        self.min = np.array(min_vals)
+        self.max = np.array(max_vals)
+        self.N = np.array(N)
+        self.dim = len(min_vals)
+        self.periodic_dims = periodic_dims if periodic_dims is not None else []
+        
+        # Grid spacing
+        self.dx = (self.max - self.min) / (self.N - 1)
+        
+        # Create grid coordinates
         self.vs = []
-        """
-        self.grid_points is same as self.vs; however, it is not reshaped. 
-        self.grid_points[i] is a numpy array with length pts_each_dim[i] 
-        """
-        self.grid_points = []
-        for i in range(dims):
-            tmp = np.linspace(self.min[i], self.max[i], num=self.pts_each_dim[i])
-            broadcast_map = np.ones(self.dims, dtype=int)
-            broadcast_map[i] = self.pts_each_dim[i]
-            self.grid_points.append(tmp)
-
-            # in order to add our range of points to our grid
-            # we need to modify the shape of tmp in order to match
-            # the size of the grid for one of the axis
-            tmp = np.reshape(tmp, tuple(broadcast_map))
-            self.vs.append(tmp)
+        for i in range(self.dim):
+            self.vs.append(np.linspace(self.min[i], self.max[i], self.N[i]))
+        
+        # Create meshgrid
+        self.xs = np.meshgrid(*self.vs, indexing='ij')
+        
+        # Axis bounds for plotting
+        self.axis = [self.min[0], self.max[0], self.min[1], self.max[1]]
 
     def __str__(self):
         return (
             f"Grid:\n"
             + f"  max: {self.max}\n"
             + f"  min: {self.min}\n"
-            + f"  pts_each_dim: {self.pts_each_dim}\n"
-            + f"  pDim: {self.pDim}\n"
+            + f"  pts_each_dim: {self.N}\n"
+            + f"  pDim: {self.periodic_dims}\n"
             + f"  dx: {self.dx}\n"
         )
-
-    def get_index(self, state: np.ndarray):
-        """ Returns a tuple of the closest index of each state in the grid
-
-        Args:
-            state (tuple): state of dynamic object
-
-        TODO: Deprecate this method
-        """
-        warnings.warn(
-            "get_index is deprecated and will be removed in a future version. Use get_indices instead.",
-            DeprecationWarning,
-            stacklevel=2  # This shows where the deprecated function was called
-        )        
-        return self.get_indices(state)
-
-    def get_value(self, V, state):
-        """Obtain the approximate value of a state
-
-        Assumes that the state is within the bounds of the grid
-
-        Args:
-            V (np.array): value function of solved HJ PDE 
-            state (tuple): state of dynamic object
-
-        Returns:
-            [float]: V(state)
-
-        TODO: Deprecate this method
-        """
-        warnings.warn(
-            "get_index is deprecated and will be removed in a future version. Use get_indices instead.",
-            DeprecationWarning,
-            stacklevel=2  # This shows where the deprecated function was called
-        )
-        return self.get_values(V, state)
-
-    def get_indices(self, states: np.ndarray) -> np.ndarray:
-        """Returns a tuple of the closest indices of each state in the grid
-
-        Args:
-            states (np.ndarray): states of dynamical system, shape (self.dims,) or 
-                                 (N, self.dims)
-
-        Returns:
-            np.ndarray: indices of each state, shape (self.dims,) or (N, self.dims)
-
-        TODO: Handle periodic dimensions correctly
-        """
-        indices = np.round((states - self.min) / self.dx)
-        indices = np.clip(indices, 0, self.pts_each_dim - 1)
-
-        return tuple(indices.astype(int).T)
-
-    def get_values(self, V: np.ndarray, states: np.ndarray) -> Union[float, np.ndarray]:
-        """
-        Obtains the approximate value of a state using nearest neighbour interpolation
-
-        Out-of-bounds state components will be clipped to the boundary of grid
-
-        Args:
-            V (np.array): value function of solved HJ PDE
-            state (np.ndarray): states, shape (self.dims,) or (N, self.dims)
-
-        Returns:
-            [float or np.ndarray]: Value(s) at states, scalar or shape (N,)
-        """
-        indices = self.get_indices(states)
-        return V[indices]
+        
+#---------------------------------------
+# Plane dynamics class
+#---------------------------------------        
+class Plane:
     
-#---------------------
+    def __init__(self, x0, wMax, vrange, dMax):
+        self.x = np.array(x0, dtype=float)
+        self.wMax = wMax
+        self.vrange = vrange
+        self.dMax = np.array(dMax)
+        self.nx = 3
+        self.nu = 2
+        self.nd = 3
+        
+    def dynamics(self, t, x, u, d):
+        """Compute dynamics: dx/dt = f(x, u, d)"""
+        dx = np.zeros(3)
+        dx[0] = u[0] * np.cos(x[2]) + d[0]
+        dx[1] = u[0] * np.sin(x[2]) + d[1]
+        dx[2] = u[1] + d[2]
+        return dx
+    
+    def optCtrl(self, t, x, deriv, uMode='min'):
+        """Optimal control"""
+        u = np.zeros(2)
+        det1 = deriv[0] * np.cos(x[2]) + deriv[1] * np.sin(x[2])
+        
+        if uMode == 'max':
+            u[0] = self.vrange[1] if det1 >= 0 else self.vrange[0]
+            u[1] = self.wMax if deriv[2] >= 0 else -self.wMax
+        elif uMode == 'min':
+            u[0] = self.vrange[0] if det1 >= 0 else self.vrange[1]
+            u[1] = -self.wMax if deriv[2] >= 0 else self.wMax
+        
+        return u
+    
+    def optDstb(self, t, x, deriv, dMode='max'):
+        """Optimal disturbance"""
+        d = np.zeros(3)
+        normDeriv12 = np.sqrt(deriv[0]**2 + deriv[1]**2)
+        
+        if normDeriv12 > 0:
+            if dMode == 'max':
+                d[0] = self.dMax[0] * deriv[0] / normDeriv12
+                d[1] = self.dMax[1] * deriv[1] / normDeriv12
+            elif dMode == 'min':
+                d[0] = -self.dMax[0] * deriv[0] / normDeriv12
+                d[1] = -self.dMax[1] * deriv[1] / normDeriv12
+        
+        if dMode == 'max':
+            d[2] = self.dMax[2] if deriv[2] >= 0 else -self.dMax[2]
+        elif dMode == 'min':
+            d[2] = -self.dMax[2] if deriv[2] >= 0 else self.dMax[2]
+        
+        return d
+    
+    def updateState(self, u, dt, d):
+        """Update state using Euler integration"""
+        dx = self.dynamics(0, self.x, u, d)
+        self.x = self.x + dx * dt
+        
+#---------------------------------------
+# Derivative Function from HelperOC Toolbox
+# https://github.com/HJReachability/helperOC
+#---------------------------------------
+
+def upwindFirstENO2(grid: Grid, data: np.ndarray, dim: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Second order ENO approximation of first derivative"""
+    dxInv = 1.0 / grid.dx[dim]
+    
+    # Add ghost cells (simple periodic or extrapolation)
+    stencil = 2
+    gdata = add_ghost_cells(data, dim, stencil)
+    
+    # First divided differences
+    D1 = dxInv * np.diff(gdata, axis=dim)
+    
+    # Second divided differences
+    D2 = 0.5 * dxInv * np.diff(D1, axis=dim)
+    
+    # Strip extra entries from D1
+    D1 = strip_dim(D1, dim, 1, 1)
+    
+    # Create left and right approximations
+    derivL = strip_dim(D1, dim, 0, 1)
+    derivR = strip_dim(D1, dim, 1, 0)
+    
+    # Add second order corrections
+    D2_left = strip_dim(D2, dim, 0, 2)
+    D2_right = strip_dim(D2, dim, 1, 1)
+    
+    derivL = derivL + grid.dx[dim] * D2_left
+    derivR = derivR - grid.dx[dim] * D2_right
+    
+    return derivL, derivR
+
+
+def upwindFirstWENO5(grid: Grid, data: np.ndarray, dim: int) -> Tuple[np.ndarray, np.ndarray]:
+    """Fifth order WENO approximation - simplified implementation"""
+    dxInv = 1.0 / grid.dx[dim]
+    stencil = 3
+    
+    # Add ghost cells
+    gdata = add_ghost_cells(data, dim, stencil)
+    
+    # Compute first divided differences
+    D1 = dxInv * np.diff(gdata, axis=dim)
+    
+    # For simplicity, use second order ENO as base
+    derivL, derivR = upwindFirstENO2(grid, data, dim)
+    
+    return derivL, derivR
+
+
+def add_ghost_cells(data: np.ndarray, dim: int, stencil: int) -> np.ndarray:
+    """Add ghost cells by extrapolation or periodic boundary"""
+    # Simple extrapolation for ghost cells
+    shape = list(data.shape)
+    shape[dim] += 2 * stencil
+    
+    gdata = np.zeros(shape)
+    
+    # Copy original data
+    slices = [slice(None)] * data.ndim
+    slices[dim] = slice(stencil, -stencil)
+    gdata[tuple(slices)] = data
+    
+    # Extrapolate boundaries
+    for i in range(stencil):
+        # Left boundary
+        slices_src = [slice(None)] * data.ndim
+        slices_src[dim] = stencil
+        slices_dst = [slice(None)] * data.ndim
+        slices_dst[dim] = stencil - i - 1
+        gdata[tuple(slices_dst)] = gdata[tuple(slices_src)]
+        
+        # Right boundary
+        slices_src[dim] = -stencil - 1
+        slices_dst[dim] = -stencil + i
+        gdata[tuple(slices_dst)] = gdata[tuple(slices_src)]
+    
+    return gdata
+
+
+def strip_dim(data: np.ndarray, dim: int, left: int, right: int) -> np.ndarray:
+    """Strip entries from left and right along dimension"""
+    slices = [slice(None)] * data.ndim
+    slices[dim] = slice(left, -right if right > 0 else None)
+    return data[tuple(slices)]
+
+
+def computeGradients(grid: Grid, data: np.ndarray) -> List[np.ndarray]:
+    """Compute gradients using upwind scheme"""
+    derivC = []
+    
+    for dim in range(grid.dim):
+        derivL, derivR = upwindFirstWENO5(grid, data, dim)
+        # Central difference
+        deriv = 0.5 * (derivL + derivR)
+        derivC.append(deriv)
+    
+    return derivC
+
+
+def eval_u(grid: Grid, gradients: List[np.ndarray], x: np.ndarray) -> np.ndarray:
+    """Evaluate gradient at point x using interpolation"""
+    deriv = np.zeros(grid.dim)
+    
+    for dim in range(grid.dim):
+        # Handle periodic dimensions
+        x_eval = x.copy()
+        if dim in grid.periodic_dims:
+            period = grid.max[dim] - grid.min[dim]
+            while x_eval[dim] > grid.max[dim]:
+                x_eval[dim] -= period
+            while x_eval[dim] < grid.min[dim]:
+                x_eval[dim] += period
+        
+        # Create interpolator
+        interp = RegularGridInterpolator(
+            grid.vs, gradients[dim], 
+            bounds_error=False, fill_value=None
+        )
+        
+        # Evaluate
+        deriv[dim] = interp(x_eval)
+    
+    # If NaN, use nearest neighbor
+    if np.any(np.isnan(deriv)):
+        for dim in range(grid.dim):
+            idx = np.argmin(np.abs(grid.vs[dim] - x[dim]))
+            if dim == 0:
+                deriv[dim] = gradients[dim][idx, :, :].mean()
+            elif dim == 1:
+                deriv[dim] = gradients[dim][:, idx, :].mean()
+            else:
+                deriv[dim] = gradients[dim][:, :, idx].mean()
+    
+    return deriv
+    
+#---------------------------------------
 # Class: Neural Operator-based HJ reachaiblity 
-#--------------------- 
+#--------------------------------------- 
     
 class HJR_FNO:
     """
@@ -286,7 +405,7 @@ class HJR_FNO:
     - Time-varying reachable set prediction
     """
 
-    def __init__(self, safe_regions, Tf_reach,  device='cuda'):
+    def __init__(self, env, safe_regions, Tf_reach,  device='cuda'):
         """
         Initialize the HJR-FNO model and grid.
 
@@ -297,6 +416,10 @@ class HJR_FNO:
         device : str
             'cuda' or 'cpu'
         """
+        
+        # Import here to avoid circular dependency
+        import utils as utils_module  
+          
         self.device = device
         
         save_path = Path(__file__).resolve().parent / "model/hjrno_dubins"
@@ -309,82 +432,102 @@ class HJR_FNO:
         self.model.to(self.device)
         self.model.eval()
         
+        #Define utils
+        self.env = env #This should be coincide with SFF_star.plotting.env such that it is shared globally
+        self.utils = utils_module.Utils(environment=env)
+        
+        
+        #Define 3D Plane dynamics
+        x_init = np.array([0, 0, 0])
+        self.wMax = 1
+        self.vrange = [0, 1]
+        self.dMax = [0, 0, 0]
+        self.plane = Plane(x_init, self.wMax, self.vrange, self.dMax)
+        
         
         # Define grid 
         self.grid_min = np.array([-10.0, -10.0, 0.0])
         self.grid_max = np.array([10.0, 10.0, 2 * math.pi])
-        self.dims = 3
-        self.N = np.array([40, 40, 20]) #Dimension for [x,y,theta] ;  original (50,50,25)
+        self.N = np.array([40, 40, 25]) #Dimension for [x,y,theta] ;  original (50,50,25)
         self.pd = [2]  # theta is periodic
 
         self.g = Grid(
             self.grid_min,
             self.grid_max,
-            self.dims,
             self.N,
             self.pd
-        )
-        
+        )        
         
         
         # Define the offset to the center of safe region 
         # (since training data assume the safe region locates at the origin)
         self.num_safe_regions = len(safe_regions)
-        self.safe_regions = safe_regions
-        self.obs_SDF = [ self.shapeCylinder(ignoreDims=[2], center=np.array([-10,-10,0]), radius=1.0) for i in range(self.num_safe_regions)]
+        self.safe_regions = np.array(safe_regions)
+        
+        # At first there is no obstacles (i.e., self.obs_list = [])
+        # Use exact reachable set precomputed ahead of time (dim 50x50x25x33)
+        mat_data = loadmat('test/HJB_training_mat/50_50_25_SDF_no_obs.mat')  # Update this path
+        data_safe = mat_data['BRT_all'][0][0] #Exact reachable set for no obstacle case
+        self.N_fine = [50,50,25,33]
+        self.g_fine = Grid(
+            self.grid_min,
+            self.grid_max,
+            self.N_fine[:3],
+            self.pd
+        )
+        # NOTE Pre-computed set "data_safe is discretized to (50,50,25,33) == (x,y,theta,time)
+        
+        self.obs_SDF = [ None for i in range(self.num_safe_regions)]
         self.obs_list = [ [] for i in range(self.num_safe_regions)] #store all obstacles seen so far for each safe region
         
-        # Params for mapping spatial coordiantes to matrix indices
-        self.env_extent = [self.grid_min[0], self.grid_max[0], self.grid_min[1], self.grid_max[1]]
-        self.num_rows, self.num_cols = self.N[:2]
-        self.x_cell_size = (self.env_extent[1] - self.env_extent[0]) / self.num_cols
-        self.y_cell_size = (self.env_extent[3] - self.env_extent[2]) / self.num_rows
-
         # Precompute spatial meshgrid (XY only)
+        self.X_fine, self.Y_fine = np.meshgrid(
+            np.linspace(self.grid_min[0], self.grid_max[0], self.N_fine[0]),
+            np.linspace(self.grid_min[1], self.grid_max[1], self.N_fine[1]),
+            indexing="ij"
+        )
+        
+        self.env_extent = [self.grid_min[0], self.grid_max[0], self.grid_min[1], self.grid_max[1]]
+
+        
         self.X, self.Y = np.meshgrid(
-            self.g.grid_points[0],
-            self.g.grid_points[1],
+            self.g.vs[0],
+            self.g.vs[1],
             indexing="ij"
         )
         self.X_flat = self.X.reshape(-1)
         self.Y_flat = self.Y.reshape(-1)
 
-        self.allGridPoints = self.g.pts_each_dim[0] * self.g.pts_each_dim[1]
+        self.allGridPoints = self.g.N[0] * self.g.N[1]
     
         
         #Theta discretization
         self.theta_min = 0
         self.theta_max = 2*math.pi
         self.theta_array = np.linspace(self.theta_min, self.theta_max, self.N[2])
+        self.theta_array_fine = np.linspace(self.theta_min, self.theta_max, self.N_fine[2])
         
         #Time discretization
         self.t0 = 0
         self.tf = 8 #Finite time reachability
-        self.time_res = 15 #time resolution
+        self.time_res =15 #time resolution
         self.time_array = np.linspace(self.t0, self.tf, self.time_res)
+        self.time_array_fine = np.linspace(self.t0, self.tf, self.N_fine[3])
         
         
-        #initilized HJR_set
-        # self.feasible_set = np.column_stack((np.empty(0), np.empty(0)))
-        
-        HJR_set_init = self.predict(
-            sdf_input=self.obs_SDF[0], 
-             # TODO Need to retrain HJR-FNO for the case where there are no obstacles, what does the reachable set look like???
-             # TODO Technically, we can just solve for the reachable set, pre-planning
-            theta_hyparam=self.theta_array, 
-            time_hyparam=self.time_array)
-        
-        self.HJR_sets = [HJR_set_init for i in range(self.num_safe_regions) ]        
+        #initilized HJR_set        
+        self.HJR_sets = [data_safe for i in range(self.num_safe_regions) ]        
         print("Finished initializing reachable sets for contingency plan.")
         
         #Last time slice to define reachable region within "Tf_reach" sec.
         self.Tf_reach = Tf_reach
-        self.Tf_slice = np.argmin(np.abs(self.time_array - self.Tf_reach))
+        
         
         #Update feasible region for sampling
         self.feasible_region = []
+        Tf_slice = np.argmin(np.abs(self.time_array_fine - self.Tf_reach))
         for reach_i in self.HJR_sets:
-            self.feasible_region.append(np.max(reach_i[...,self.Tf_slice].cpu().numpy(), axis=2))
+            self.feasible_region.append(np.max(reach_i[...,Tf_slice], axis=2))
             
             
         
@@ -409,11 +552,11 @@ class HJR_FNO:
         g = self.g
 
         assert (
-            sdf_input.shape[0] == g.pts_each_dim[0]
-            and sdf_input.shape[1] == g.pts_each_dim[1]
+            sdf_input.shape[0] == g.N[0]
+            and sdf_input.shape[1] == g.N[1]
         ), (
             f"sdf_input spatial dimensions must be "
-            f"({g.pts_each_dim[0]}, {g.pts_each_dim[1]}), "
+            f"({g.N[0]}, {g.N[1]}), "
             f"but got {sdf_input.shape[:2]}"
         )
 
@@ -493,8 +636,8 @@ class HJR_FNO:
 
         # Reshape to (Nx, Ny, Ntheta, Nt)
         pred_reshaped = torch.zeros(
-            self.g.pts_each_dim[0],
-            self.g.pts_each_dim[1],
+            self.g.N[0],
+            self.g.N[1],
             TH,
             T
         )
@@ -503,8 +646,8 @@ class HJR_FNO:
         for t_i in range(T):
             for th_i in range(TH):
                 pred_reshaped[:, :, th_i, t_i] = pred[idx].reshape(
-                    self.g.pts_each_dim[0],
-                    self.g.pts_each_dim[1]
+                    self.g.N[0],
+                    self.g.N[1]
                 )
                 idx += 1
 
@@ -521,12 +664,12 @@ class HJR_FNO:
         - radius: float, cylinder radius
 
         @return
-        - sdf: signed distance field with shape g.pts_each_dim
+        - sdf: signed distance field with shape g.N
         """
 
 
         g = self.g
-        dim = g.dims
+        dim = g.dim
 
         # Default arguments
         if ignoreDims is None:
@@ -538,13 +681,13 @@ class HJR_FNO:
         ignoreDims = set(ignoreDims)
 
         # Allocate signed distance array
-        data_shape = tuple(g.pts_each_dim)
+        data_shape = tuple(g.N)
         dist_squared = np.zeros(data_shape)
 
         # Accumulate squared distance over ACTIVE dimensions
         for i in range(dim):
             if i not in ignoreDims:
-                dist_squared += (g.vs[i] - center[i])**2
+                dist_squared += (g.xs[i] - center[i])**2
 
         # Euclidean norm in active dimensions
         dist = np.sqrt(dist_squared)
@@ -553,7 +696,6 @@ class HJR_FNO:
         sdf = dist - radius
 
         return sdf
-    
     
     def update_obs(self, obs_cir:List):
         '''
@@ -564,6 +706,7 @@ class HJR_FNO:
         '''
         # NOTE For now, Only consider circular obstacle since training data only consider spherical obstacles
         # NOTE this function updates SDF for every newly-detected obstacle only. It does not have memory of all obstacles seen in the past
+        
         
         # Iterate through each safe region that we want to update
         for i in range(self.num_safe_regions):
@@ -586,7 +729,11 @@ class HJR_FNO:
                     obs_sdf = self.shapeCylinder(ignoreDims=[2], center=center, radius=r)
                     
                     #Union of all observed obstacles
-                    self.obs_SDF[i] = np.minimum(self.obs_SDF[i], obs_sdf)
+                    if not self.obs_list[i]:
+                        self.obs_SDF[i] = obs_sdf
+                    else:
+                        self.obs_SDF[i] = np.minimum(self.obs_SDF[i], obs_sdf)
+
                     self.obs_list[i].append(obs) #store the newly detected obstacle
                     
             #if new obstacle lies within the grid range of the reachable set, we need to update the reachable set
@@ -597,103 +744,615 @@ class HJR_FNO:
             
         #Update feasible region (find miminal set with respect to all theta slices) for RRT planning
         for i, reach_i in enumerate(self.HJR_sets):
-            self.feasible_region[i] = np.max(reach_i[...,self.Tf_slice].cpu().numpy(), axis=2)
             
-    # def update_feasible_set(self, theta_slice, time_slice):
-    #     '''
-    #     Find all feasible points for RRT samplings with V(x,y) <= 0 (i.e., inside the reachable set)
-    #     '''
+            #Find time slice of the reachable set
+            if self.obs_list[i]:
+                reach_i = reach_i.cpu().numpy()
+                Tf_slice = np.argmin(np.abs(self.time_array - self.Tf_reach))
+                                     
+            #Special case: No obstacle yet, we use exact (pre-computed) reachable set with finer discretization
+            else:
+                Tf_slice = np.argmin(np.abs(self.time_array_fine - self.Tf_reach))
+                
+            self.feasible_region[i] = np.max(reach_i[..., Tf_slice], axis=2)
         
-    #     X_all = []
-    #     Y_all = []
-
-    #     for i, reach_i in enumerate(self.HJR_sets):
-    #         V_xy = reach_i[:, :, theta_slice, time_slice]      # (50, 50)
-    #         mask = V_xy <= self.safe_margin                                   # boolean
-    #         idx = torch.nonzero(mask, as_tuple=False)          # (K, 2)
-
-    #         if idx.numel() == 0:
-    #             continue
-
-    #         X_vals = self.X[idx[:, 0], idx[:, 1]] + self.safe_regions[i][0] #translate coordinates to centered at each safe_region
-    #         Y_vals = self.Y[idx[:, 0], idx[:, 1]] + self.safe_regions[i][1] #translate coordinates to centered at each safe_region
-
-    #         X_all.append(X_vals)
-    #         Y_all.append(Y_vals)
-
-    #     # concatenate into single arrays
-    #     if X_all:
-    #         X_all = np.concatenate(X_all)
-    #         Y_all = np.concatenate(Y_all)
-    #     else:
-    #         X_all = np.empty(0)
-    #         Y_all = np.empty(0)
-            
-    #     self.feasible_set = np.column_stack((X_all, Y_all))
+    def ys_to_cols(self, ys: np.ndarray, N=None) -> np.ndarray:
         
-    def ys_to_cols(self, ys: np.ndarray) -> np.ndarray:
-        cols = ((ys - self.env_extent[2]) / self.y_cell_size).astype(int)
-        np.clip(cols, 0, self.num_cols - 1, out=cols)
+        if N is None:
+            N = self.N
+        
+        num_rows, num_cols = N[:2]
+        y_cell_size = (self.env_extent[3] - self.env_extent[2]) / num_rows
+        
+        cols = ((ys - self.env_extent[2]) / y_cell_size).astype(int)
+        np.clip(cols, 0, num_cols - 1, out=cols)
         return cols
 
-    def xs_to_rows(self, xs: np.ndarray) -> np.ndarray:
-        rows = ((xs - self.env_extent[0]) / self.x_cell_size).astype(int)
-        np.clip(rows, 0, self.num_rows - 1, out=rows)
-        return rows
+    def xs_to_rows(self, xs: np.ndarray, N=None) -> np.ndarray:
         
-    def is_feasible(self, v, theta_slice, time_slice):
+        if N is None:
+            N = self.N
+        
+        num_rows, num_cols = N[:2]
+        self.x_cell_size = (self.env_extent[1] - self.env_extent[0]) / num_cols
+        
+        rows = ((xs - self.env_extent[0]) / self.x_cell_size).astype(int)
+        np.clip(rows, 0, num_rows - 1, out=rows)
+        return rows
+    
+    def is_state_feasible(self, robot_pose:np.array, theta_array:np.array, t=None, reachable_set_constraint=True) -> bool:
+        
+                
+        #If no reachable set constraint, always feasible
+        if reachable_set_constraint == False:
+            return True
+        
+        if t is None:
+            t= self.Tf_reach
+                        
+        closest_idx = self.find_feasible_closest_region(robot_pose, t=t)
+        # print(closest_idx)
+        
+        if closest_idx is None:
+            return False
+        
+        
+        # ------------------------------------------------------------
+        # Robot positions (GLOBAL)
+        # ------------------------------------------------------------
+        robots_xy = robot_pose                        # (M, 2)
+        safe_centers = self.safe_regions[closest_idx, :2]      # (M, 2)
+
+        # Robot positions in LOCAL frame
+        robots_local = robots_xy - safe_centers                # (M, 2)
+        
+        within_bounds = np.all(
+            (robots_local >= -10) & (robots_local <= 10)
+        )
+        
+        if not within_bounds:
+            return False
+
+        # ------------------------------------------------------------
+        # Build obstacle lists PER ROBOT in LOCAL frame
+        # ------------------------------------------------------------
+        centers_local_list = []
+        radii_list = []
+
+        for i, k in enumerate(closest_idx):
+            if len(self.obs_list[k]) == 0:
+                # Dummy obstacle already in LOCAL frame (so far away that it does not affect SDF)
+                centers_local_list.append([[10.0, 10.0]])
+                radii_list.append([1.0])
+            else:
+                obs = np.asarray(self.obs_list[k])              # (Mi, 3)
+                centers_global = obs[:, :2]                      # (Mi, 2)
+                radii = obs[:, 2]                                # (Mi,)
+
+                # Convert obstacle centers to LOCAL frame
+                centers_local = centers_global - safe_centers[i]
+
+                centers_local_list.append(centers_local)
+                radii_list.append(radii)
+
+        # ------------------------------------------------------------
+        # Stack and align
+        # ------------------------------------------------------------
+        centers_local_all = np.vstack(centers_local_list)       # (ΣMi, 2)
+        radii_all = np.concatenate(radii_list)                  # (ΣMi,)
+
+        obs_counts = np.array([len(r) for r in radii_list])
+
+        robots_local_rep = np.repeat(robots_local, obs_counts, axis=0)
+
+        # ------------------------------------------------------------
+        # Compute SDF
+        # ------------------------------------------------------------
+        sdf_all = np.linalg.norm(
+            centers_local_all - robots_local_rep,
+            axis=1
+        ) - radii_all
+
+        split_idx = np.cumsum(obs_counts)[:-1]
+        obs_sdf = np.minimum.reduceat(sdf_all, np.r_[0, split_idx])  # (M,)
+        
+        # ------------------------------------------------------------
+        # Build xx_query tensor
+        # Shapes:
+        # obs_sdf        : (32,)
+        # robots_local   : (32, 2)
+        # theta_array    : (TH,)
+        # t              : scalar
+        
+        TH = len(theta_array)
+
+        obs_sdf_t = torch.from_numpy(obs_sdf).float().to(self.device)
+        robots_t  = torch.from_numpy(robots_local).float().to(self.device)
+        theta_t   = torch.from_numpy(theta_array).float().to(self.device)
+
+        xx_query = torch.empty((TH, 32, 5), device=self.device)
+
+        xx_query[:, :, 0] = obs_sdf_t[None, :]
+        xx_query[:, :, 1] = robots_t[:, 0][None, :]
+        xx_query[:, :, 2] = robots_t[:, 1][None, :]
+        xx_query[:, :, 3] = theta_t[:, None]
+        xx_query[:, :, 4] = float(t)
+
+
+
+        # ------------------------------------------------------------
+        # Run FNO inference
+        # ------------------------------------------------------------
+        with torch.no_grad():
+            out = self.model(xx_query)
+
+        is_feasible = torch.all(out <= 0).item()
+        return is_feasible
+
+            
+        
+    def is_feasible(self, v:Tuple, reachable_set_constraint=True) -> bool:
         
         #TODO instead of finding the closest index, it might be better to predict for HJR-FNO at the current state (might be faster)
         #                                           (implement this with is_feasible_ray altogether)
         
-        #check if the node 'v' is inside one of the safe reachable set
-        for i, feasible_i in enumerate(self.feasible_region):
-            
-            #find closest matrix indices to the Node
-            rows = self.xs_to_rows(np.array([v.x - self.safe_regions[i][0]]))
-            cols = self.ys_to_cols(np.array([v.y - self.safe_regions[i][1]]))
-            
-            row = int(rows[0])
-            col = int(cols[0])
-            
-            if feasible_i[row, col] <= self.safe_margin:
-                return True
+        #If no reachable set constraint, always feasible
+        if reachable_set_constraint == False:
+            return True
         
-        return False
+        closest_idx = self.find_feasible_closest_region(robot_pose=np.array([v[0], v[1]]))
+        closest_idx = closest_idx[0]
+        safe_centers = self.safe_regions[closest_idx, :2]      # (M, 2)
+
+        # Robot positions in LOCAL frame
+        robots_local = np.array([v[0], v[1]]) - safe_centers     # (M, 2)
+        
+        #Check within bounds
+        within_bounds = np.all(
+            (robots_local >= -10) & (robots_local <= 10)
+        )
+        
+        if not within_bounds:
+            return False
+        
+        #Define discretization based on obstacle presence
+        if not self.obs_list[closest_idx]:
+                N = self.N_fine #no obstacles, use exact reachable set with pre-defined discretization
+        else:
+            N = self.N #user-defined discretization for Neural Operator
+            
+        #find closest matrix indices to the Node
+        rows = self.xs_to_rows(np.array([robots_local[0]]), N=N)
+        cols = self.ys_to_cols(np.array([robots_local[1]]), N=N)
+        
+        row = int(rows[0])
+        col = int(cols[0])
+        
+        return self.feasible_region[closest_idx][row, col] <= self.safe_margin
+        
+        
+        '''OLD CODE'''
+        # for i, feasible_i in enumerate(self.feasible_region):
+            
+        #     if not self.obs_list[i]:
+        #         N = self.N_fine #no obstacles, use exact reachable set with pre-defined discretization
+        #     else:
+        #         N = self.N #user-defined discretization for Neural Operator
+            
+        #     #find closest matrix indices to the Node
+        #     rows = self.xs_to_rows(np.array([v[0] - self.safe_regions[i][0]]), N=N)
+        #     cols = self.ys_to_cols(np.array([v[1] - self.safe_regions[i][1]]), N=N)
+            
+        #     row = int(rows[0])
+        #     col = int(cols[0])
+            
+        #     if feasible_i[row, col] <= self.safe_margin:
+        #         return True
+        
+        # return False
+
+    def find_feasible_closest_region(self, robot_pose:np.array, t=None, use_distance=True):        
+        
+        '''
+        Find the closest feasible safe region based on euclidean distance
+        - can pass in array of robot states for batch processing
+        '''
+        if use_distance:
+            # Extract positions
+            robots  = np.atleast_2d(robot_pose)              # (M, 2)
+            centers = self.safe_regions[:, :2]         # (N, 2)
+
+            # Compute squared distances using broadcasting
+            # Result shape: (M, N)
+            dist2 = np.sum(
+                (robots[:, None, :] - centers[None, :, :])**2,
+                axis=2
+            )
+
+            # Closest safe region index for each robot
+            closest_indices = np.argmin(dist2, axis=1)  # (M,)
+            
+            return closest_indices
+
+        else:
+            '''
+            TODO: Make this handle batch of robot states as well
+            
+            Find the closest feasible safe region based on look-up values from HJB reachable set
+            - more expensive
+            '''
+            x_r, y_r, theta = robot_pose
+
+            feasible_regions = []
+            HJB_values = []
+            
+            if t is None:
+                t = self.Tf_reach
+                
+            # robot's position is local frame of each safe region
+            local_positions = np.array([x_r, y_r]) - self.safe_regions[:, :2] 
+            
+            # only consider safe regions that the robot's position is within local grid bounds
+            within_bound_mask = (np.abs(local_positions) <= 10).all(axis=1)     
+
+            local_positions_filtered = local_positions[within_bound_mask]
+            
+            #boolean checking which safe regions have obstacles
+            obs_nonempty = np.fromiter(
+                (len(obs) > 0 for obs in self.obs_list),
+                dtype=bool,
+                count=len(self.obs_list),
+            )
+            
+            idx_empty = np.where(within_bound_mask & ~obs_nonempty)[0] 
+            idx_nonempty = np.where(within_bound_mask & obs_nonempty)[0]
+            
+            #smaller subset of local positions
+            local_empty     = local_positions[idx_empty]
+            local_nonempty  = local_positions[idx_nonempty]
+            
+            # Convert continuous position to grid indices  
+            # - no obstacles, use exact reachable set with pre-computed finer discretization       
+            rows_e = self.xs_to_rows(local_empty[:, 0], N=self.N_fine)
+            cols_e = self.ys_to_cols(local_empty[:, 1], N=self.N_fine)
+
+            rows_e = rows_e.astype(int)
+            cols_e = cols_e.astype(int)
+            
+            theta_slice_f = np.argmin(np.abs(self.theta_array_fine - theta))
+            time_slice_f  = np.argmin(np.abs(self.time_array_fine  - t))
+
+            
+            # - obstacles present, use Neural Operator reachable set with coarse discretization
+            rows_n = self.xs_to_rows(local_nonempty[:, 0], N=self.N)
+            cols_n = self.ys_to_cols(local_nonempty[:, 1], N=self.N)
+
+            rows_n = rows_n.astype(int)
+            cols_n = cols_n.astype(int)
+            
+            theta_slice_c = np.argmin(np.abs(self.theta_array - theta))
+            time_slice_c  = np.argmin(np.abs(self.time_array  - t))
+
+
+
+            #Collect all look-up values from the HJB sets
+            vals_e = np.array([
+                self.HJR_sets[i][rows_e[k], cols_e[k], theta_slice_f, time_slice_f]
+                for k, i in enumerate(idx_empty)
+            ])
+            
+            vals_n = np.array([
+                self.HJR_sets[i][rows_n[k], cols_n[k], theta_slice_c, time_slice_c]
+                for k, i in enumerate(idx_nonempty)
+            ])
+            
+            # Check feasibility: inside reachable set
+            feasible_e = vals_e <= 0
+            feasible_n = vals_n <= 0
+
+            feasible_indices = np.concatenate([
+                idx_empty[feasible_e],
+                idx_nonempty[feasible_n],
+            ])
+
+            HJB_values = np.concatenate([
+                vals_e[feasible_e],
+                vals_n[feasible_n],
+            ])
+            
+            # Choose the feasible region with smallest value fucntion
+            if len(feasible_indices) > 0:
+                closest_idx = feasible_indices[int(np.argmin(HJB_values))]
+                return closest_idx
+            else:
+                return None # no feasible region found
+
         
     '''
     For Contingency Planning toward safe region
     '''
     
-    # def compute_hjb_gradients(self):
-    #     """
-    #     Compute spatial derivatives of V(x,y,theta) at a fixed time slice.
 
-    #     V: (Nx, Ny, Ntheta) ndarray
-    #     Returns: dVdx, dVdy, dVdtheta
-    #     """
+    def contingency_policy(self, robot_state:List, plotting, fig:Figure, ax:Axes):
+    
+        
+        closest_idx = self.find_feasible_closest_region(robot_pose=np.array(robot_state[:2]))
+        assert closest_idx is not None , "No feasible safe region found for contingency!"
+        
+        closest_idx = closest_idx[0]
+        
+        #Update state in dynamics w.r.t. local frame
+        x_r, y_r, theta = robot_state
+        x_r_local = x_r - self.safe_regions[closest_idx][0]
+        y_r_local = y_r - self.safe_regions[closest_idx][1]
         
         
-    #     self.N = np.array([50, 50, 25]) #Dimension for [x,y,theta] ;  original (50,50,25)
-
-    #     self.g = Grid(
-    #         self.grid_min,
-    #         self.grid_max,
-    #         self.dims,
-    #         self.N,
-    #         self.pd
-    #     )
+        robot_state_local = np.array([x_r_local, y_r_local, theta])
+        self.plane.x = robot_state_local
         
-    #     dx = self.g.dx[0]
-    #     dy = self.g.dx[1]
-    #     dtheta = self.g.dx[2]
+        #Define reachable set
+        data_safe = self.HJR_sets[closest_idx]  
+        if torch.is_tensor(data_safe):
+            data_safe = data_safe.cpu().numpy()
         
-    #     dVdx, dVdy, dVdtheta = np.gradient(
-    #         V, dx, dy, dtheta, edge_order=2
-    #     )
-
-    #     return dVdx, dVdy, dVdtheta
-
+        '''
+        Find tEarliest: the smallest time index where the current state is in the BRS
+        This represents the earliest time the robot can reach the target
+        '''
         
+        # Determine which time array to use, based on different discretization
+        if self.obs_list[closest_idx]:
+            time_array = self.time_array  # HJR-FNO reachable set with user-defined discretization
+            grid = self.g
+        else:
+            time_array = self.time_array_fine  # finer discretization for no obstacle case
+            grid = self.g_fine
+        
+        theta_slice = np.argmin(np.abs(grid.vs[2] - self.plane.x[2]))
+        tauLength = len(time_array)
+        subSamples = 4
+        dtSmall = (time_array[1] - time_array[0]) / subSamples
+        
+        # Binary search for the smallest time index where state is in BRS
+        upper = tauLength - 1
+        lower = 0
+        
+        def is_in_BRS(time_idx):
+            """Check if current state is inside BRS at given time index"""
+            # Convert continuous position to grid indices
+            rows = self.xs_to_rows(np.array([self.plane.x[0]]), N=grid.N)
+            cols = self.ys_to_cols(np.array([self.plane.x[1]]), N=grid.N)
+            row = int(rows[0])
+            col = int(cols[0])
             
+            # Check bounds
+            if not (0 <= row < data_safe.shape[0] and 0 <= col < data_safe.shape[1]):
+                return False
+                
+            return data_safe[row, col, theta_slice, time_idx] <= 0
+        
+        # Binary search to find the minimum time index where state is in BRS
+        tEarliest = tauLength  # Default: not in any BRS
+        while lower <= upper:
+            mid = (lower + upper) // 2
+            if is_in_BRS(mid):
+                tEarliest = mid  # Found a valid index, try to find smaller
+                upper = mid - 1
+            else:
+                lower = mid + 1
+                
+        # print("tEarliest", tEarliest)
+        
+        # Check if robot is in any BRS (if not, we have a problem)
+        if tEarliest >= tauLength:
+            print("Warning: Robot state is not in any reachable set!")
+        
+        # Check if trajectory has reached the target (smallest set)
+        if tEarliest == 0:
+            print("Trajectory has entered the target!")
+            return [], np.array([robot_state])  # Already at target, no contingency needed
+    
+        
+        # State-based time tracking
+        t = time_array[tEarliest]
+        t_max = self.tf
+        trajectory = np.array([x_r, y_r, theta])
 
+        
+        
+        
+        #Transfer all obstacles seen so far
+        obs_circle = plotting.obs_circle.copy()
+        unknown_obs_circle = plotting.unknown_obs_circle.copy()
+        self.utils.update_obs(obs_circle, self.utils.obs_boundary, [], unknown_obs_circle)
+        
+        #Store only new obstacles detected during contingency
+        detected_obs_list = []
+        
+        # #Colorbar 
+        # cax = fig.add_axes([0.88, 0.15, 0.03, 0.7])  # [left, bottom, width, height]
+        # cbar = None
+            
+        while t > 0:
+            
+            
+                            
+            # Find next time step
+            time_idx = np.argmin(np.abs(time_array - t))
+        
+            t_next = time_array[time_idx - 1] # step back in time
+                        
+            # Work BACKWARD in time: start from the largest set (end) toward target (beginning)
+            # Find the time slice by going backward: map forward simulation time to backward BRT time
+            # time_remaining = t_max - t  # How much time left until target
+            # brt_time_slice = np.argmin(np.abs(time_array - time_remaining))
+            brt_time_slice = time_idx
+            
+            # time_remaining_after_next = self.tf - t_next  # How much time left until target
+            # brt_time_next_slice = np.argmin(np.abs(time_array - time_remaining_after_next))
+            
+            # # Convert continuous position to grid indices
+            # rows = self.xs_to_rows(np.array([x_r_local]), N=grid.N)
+            # cols = self.ys_to_cols(np.array([y_r_local]), N=grid.N)
+            # row = int(rows[0])
+            # col = int(cols[0])
+            
+            # if data_safe[row, col, theta_slice, brt_time_slice] <= 0 and data_safe[row, col, theta_slice, brt_time_next_slice] <= 0:
+            #     #If already inside the safe reachable set, keep shrinking the reachable set until we find the minimal-time slice
+            #     t = t_next
+            #     continue
+            
+            
+            
+            """
+            Apply HJB optimal control to return to safe region, given then the minimal-time reachable set is found
+            """
+            
+            data_safe = self.HJR_sets[closest_idx]  
+            if torch.is_tensor(data_safe):
+                data_safe = data_safe.cpu().numpy()
+            
+            # Use the reachable set at this backward time
+            data_union = data_safe[:, :, :, brt_time_slice]
+            
+            # Compute gradients
+            Deriv = computeGradients(grid, data_union) 
+            for j in range(subSamples):
+                deriv = eval_u(grid, Deriv, self.plane.x)
+                
+                # Compute optimal control
+                u = self.plane.optCtrl(time_array[time_idx], self.plane.x, deriv, 'min')
+                d = self.plane.optDstb(time_array[time_idx], self.plane.x, deriv, 'max')
+                
+                # Update state
+                self.plane.updateState(u, dtSmall, d)
+    
+            x_r = self.plane.x[0] +  self.safe_regions[closest_idx][0]
+            y_r = self.plane.x[1] +  self.safe_regions[closest_idx][1]
+            theta = self.plane.x[2]
+            theta_slice = np.argmin(np.abs(grid.vs[2] - theta))
+            
+            #Sense for new obstacles
+            # - use global coordinate
+            _ , detected_obs = self.utils.lidar_detected(robot_position=(x_r, y_r))
+            # NOTE: utils.unknown_obs is updated within lidar_detected()
+            
+            # Store trajectory
+            trajectory = np.vstack((  trajectory , np.array([x_r, y_r, theta])))
+    
+            # Advance time
+            t = t_next
+
+            #Update reachable set
+            if len(detected_obs) > 0:
+                print("Update reachable set with newly detected obstacles: ", detected_obs)
+                
+                self.update_obs(detected_obs) # Update all reachable sets with newly detected obstacles
+                for obs in detected_obs:
+                    detected_obs_list.append(obs) #update only new obstacles detected during contingency
+                    obs_circle.append(obs) #update global obs_circle for ALL obstacles seen so far
+                    
+                # Determine which time array to use, based on different discretization
+                if self.obs_list[closest_idx]:
+                    time_array = self.time_array #HJR-FNO reachable set with user-defined discretization
+                    grid = self.g
+                    
+                else:
+                    time_array = self.time_array_fine #finer discretization for no obstacle case (since we precomputed this)
+                    grid = self.g_fine
+                dtSmall = (time_array[1] - time_array[0]) / subSamples
+                    
+            #Update obstacles for plotting and collision checking   
+            plotting.update_obs(obs_circle, self.utils.obs_boundary, [], self.utils.unknown_obs_circle) # for plotting obstacles
+            self.utils.update_obs(obs_circle, self.utils.obs_boundary, [], self.utils.unknown_obs_circle) # for collision checking
+                
+                
+            # # Plot contingency plan
+            # if cbar is not None:
+            #     cbar.ax.cla()     # clear axis first
+            #     cbar.remove()
+            #     cbar = None
+            #     cax = fig.add_axes([0.88, 0.15, 0.03, 0.7])
+                
+            ax.clear()
+            
+            fig.suptitle(f"HJR-FNO Contincgency\n Safe Region: {self.safe_regions[closest_idx][:2]} | Time to Target: {self.tf - t:.2f}s")
+
+            # restore static axis properties
+            ax.set_xlim(self.env.x_range[0], self.env.x_range[1] + 1)
+            ax.set_ylim(self.env.y_range[0], self.env.y_range[1] + 1)
+
+            # draw environment
+            plotting.plot_env(ax)
+            
+            # draw robot + lidar + heading
+            plotting.plot_robot(ax, [x_r, y_r], self.utils.sensing_radius)
+            
+            arrow_len = 0.03 * max(self.env.x_range[1] - self.env.x_range[0],  self.env.y_range[1] - self.env.y_range[0])
+            dx = arrow_len * np.cos(theta)
+            dy = arrow_len * np.sin(theta)
+
+            ax.quiver(
+                x_r, y_r,          # base position
+                dx, dy,            # direction vector
+                angles="xy",
+                scale_units="xy",
+                scale=1,
+                color="red",
+                width=0.006,
+                zorder=10
+            )
+            
+            ax.plot(trajectory[:,0], trajectory[:,1], 
+                   'r-', linewidth=2.5, label='Trajectory', zorder=5)
+
+            print(f"Point: {(trajectory[-1,0], trajectory[-1,1])}, Feasible? {self.is_feasible((trajectory[-1,0], trajectory[-1,1]))}")
+            
+            # plot reachable set at current heading
+            Z = data_union[..., theta_slice]
+
+            # mask out values > 0
+            Z_masked = np.ma.masked_where(Z > 0, Z)
+            
+            rows = self.xs_to_rows(np.array([self.plane.x[0]]), N=grid.N)
+            cols = self.ys_to_cols(np.array([self.plane.x[1]]), N=grid.N)
+            row = int(rows[0])
+            col = int(cols[0])
+            
+            Z_masked[row, col] = np.nan  # ensure current position is visible
+
+            contourf = ax.contourf(
+                grid.xs[0][..., 0] + self.safe_regions[closest_idx][0],
+                grid.xs[1][..., 0] + self.safe_regions[closest_idx][1],
+                Z_masked,
+                levels=50,
+                cmap="Blues_r",
+                vmin=np.min(Z),          # keep original scale
+                vmax=np.max(Z),
+                alpha=0.7
+            )
+
+            
+            #colorbar
+            # create fresh colorbar
+            # cbar = fig.colorbar(contourf, cax=cax)
+            # cbar.set_label("Value Function", fontsize=8)
+            
+            
+            CS = ax.contour(
+                    grid.xs[0][...,0] + self.safe_regions[closest_idx][0],
+                    grid.xs[1][...,0] + self.safe_regions[closest_idx][1],
+                    Z ,
+                    levels=[0],
+                    colors='magenta',
+                    linewidths=2
+            )   
+            
+            plt.pause(0.3) #original 0.3s            
+        # if cbar is not None:
+        #     cbar.ax.cla()     # clear axis first
+        #     cbar.remove()
+        #     cbar = None
+
+
+        return detected_obs_list, trajectory

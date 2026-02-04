@@ -1,31 +1,42 @@
+# =========================
+# Standard library imports
+# =========================
 import os
 import sys
 import time
 import math
 import heapq
-from typing import Dict, List, Tuple
-import itertools    
+import itertools
+import traceback
+import random
+import numbers
 from collections import deque
 from collections.abc import Sequence
-import kdtree
+from typing import Dict, List, Tuple
+from pathlib import Path
+
+# =========================
+# Third-party imports
+# =========================
 import numpy as np
+import kdtree
 import matplotlib.pyplot as plt
 from matplotlib.collections import LineCollection
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
+import dill
 
-import env, plotting, utils, queue_utils
-
-from typing import Tuple, List, Sequence
-import numbers
-
-from HJR_FNO import HJR_FNO, FNO1d, SpectralConv1d, Grid
-
-import traceback
-
-import random
-
+# =========================
+# Local / project imports
+# =========================
+import env
+import plotting
+import utils
 import atsp
+
+# Import these at module level for PyTorch unpickling
+# This is safe because we're not importing HJR_FNO class itself
+from HJR_FNO.HJR_FNO import FNO1d, SpectralConv1d
 
 
 
@@ -92,13 +103,14 @@ class Node(Sequence):
             try:
                 self.parent.children.remove(self)
             except:
-                traceback.print_stack(limit=5)
-                print('KeyError in set_parent()')
-                print('Node', (self.x, self.y))
-                print('cost', (self.cost_to_goal, self.lmc))
-                print("Node's Parent", (self.parent.x, self.parent.y))
-                for child in self.parent.children:
-                    print("- children", (child.x, child.y))
+                print("")
+                # traceback.print_stack(limit=5)
+                # print('KeyError in set_parent()')
+                # print('Node', (self.x, self.y))
+                # print('cost', (self.cost_to_goal, self.lmc))
+                # print("Node's Parent", (self.parent.x, self.parent.y))
+                # for child in self.parent.children:
+                #     print("- children", (child.x, child.y))
         
         self.parent = new_parent
         new_parent.children.add(self)
@@ -158,6 +170,9 @@ class Node(Sequence):
     
 
 class RRTX:
+    
+    from HJR_FNO.HJR_FNO import HJR_FNO, Grid
+    
     def __init__(
         self,
         x_start: Tuple[float, float],
@@ -173,9 +188,10 @@ class RRTX:
         iter_max: int,
         safe_regions: List[Sequence[float]],
         hjr_fno: HJR_FNO,
+        HJ_contingency_enable: bool,
         fig: Figure,
         ax: Axes,
-        plotting: plotting.Plotting
+        plotting: plotting.Plotting,
         ) -> None:
         
         # Start and Goal
@@ -191,9 +207,7 @@ class RRTX:
         self.other_goals = []
         for g in other_goals:
             self.other_goals.append(Node((g[0],g[1])))
-            
-        # self.curr_tree_idx = 0 #This will be set when robot is decided which other target locations it is starting on
-            
+                        
         
         
         # RRTx configs
@@ -216,22 +230,21 @@ class RRTX:
         self.robot_path_to_goal = False
         
         #State and Sensor
-        # self.robot_state = [self.s_bot.x, self.s_bot.y, heading]
+        self.robot_state = [0,0,0]
         # self.robot_position = [self.s_bot.x, self.s_bot.y]
         self.robot_speed = 0.6 # m/s
         self.lidar_range = lidar_range
+        self.utils.sensing_radius = lidar_range
         
         #HJR-FNO configs
         self.Tf_reach = hjr_fno.Tf_reach #must be less than 8s (underapproximation of the training data)
         self.hjr_fno = hjr_fno #HJR_FNO(safe_regions=safe_regions, Tf_reach=self.Tf_reach)
+        self.hjr_fno.utils.sensing_radius = lidar_range
         self.safe_regions = safe_regions
+        self.HJ_contingency_enable = HJ_contingency_enable
+        self.contingency_triggered = False 
         
-        #Convert current robot's attitude to indices (slice of the reachable set)
-        heading = 0.0
-        self.theta_slice = np.argmin(np.abs(self.hjr_fno.theta_array - (heading % (2*np.pi))))
-        self.time_slice = np.argmin(np.abs(self.hjr_fno.time_array - self.Tf_reach))
-        
-        
+            
         #Plotting
         self.path = [] #robot's path
         self.multi_paths = [[] for _ in range(len(self.other_goals))]
@@ -261,24 +274,7 @@ class RRTX:
         self.zeta_d = np.pi # volume of the unit d-ball in the d-dimensional Euclidean space
         self.gamma_FOS = gamma_FOS # factor of safety so that gamma > expression from Theorem 38 of RRT* paper
         self.update_gamma() # initialize gamma
-        
-        # PriorityQueue with respect to other goal location
-        #
-        # Q_ij structure:
-        # key   -> j-th goal (tuple)
-        # value -> heap of (dist, node_id, node)
-        # self.Q_other_goals: Dict[Tuple[float, float], List[Tuple[float, int, Node]]] = {goal_j: [] for goal_j in other_goals}
-        self.Q_other_goals = {}
 
-        for goal_j in self.other_goals:
-            d = math.hypot(
-                self.s_goal.x - goal_j.x,
-                self.s_goal.y - goal_j.y
-            )
-            self.Q_other_goals[goal_j] = [
-                (d, self.s_goal.id, self.s_goal)
-            ]
-            heapq.heapify(self.Q_other_goals[goal_j])
         
 
     def _dist_to_goal(self, node: Node, goal: Tuple[float, float]) -> float:
@@ -291,9 +287,6 @@ class RRTX:
 
         # set seed for reproducibility
         # np.random.seed(0)
-
-        # set up event handling
-        # self.fig.canvas.mpl_connect('button_press_event', self.update_obstacles)
         
         if iter_max is None:
             iter_max = self.iter_max
@@ -303,12 +296,8 @@ class RRTX:
         self.edge_col.set_animated(True)
         self.path_col.set_animated(True)
         plt.show(block=False)
-        plt.pause(0.1)
         self.ax.draw_artist(self.edge_col)
         self.fig.canvas.blit(self.ax.bbox)
-        start_time = time.time()
-        prev_plotting = time.time()
-        first_time = True
 
         for i in range(iter_max):
             
@@ -449,14 +438,12 @@ class RRTX:
         
         if new_heading is not None:           
             self.robot_state[2] = new_heading
-            self.theta_slice = np.argmin(np.abs(self.hjr_fno.theta_array - (new_heading % (2*np.pi))))
             
         elif self.s_bot.parent is not None:
             dx = self.s_bot.parent.x - self.s_bot.x
             dy = self.s_bot.parent.y - self.s_bot.y
             heading = math.atan2(dy, dx)
             self.robot_state[2] = heading
-            self.theta_slice = np.argmin(np.abs(self.hjr_fno.theta_array - (heading % (2*np.pi))))
             
             
     
@@ -509,24 +496,12 @@ class RRTX:
         self.robot_position = [self.s_bot.x, self.s_bot.y]
                  
     def planning_with_robot(self , steps=10):
-
-        # animation stuff
-        # plt.gca().set_aspect('equal', adjustable='box')
-        # self.edge_col.set_animated(True)
-        # self.path_col.set_animated(True)
-        # plt.show(block=False)
-        # plt.pause(0.1)
-        # self.ax.draw_artist(self.edge_col)
-        # self.fig.canvas.blit(self.ax.bbox)
-        # start_time = time.time()
-        # prev_plotting = time.time()
-        # first_time = True
         
         new_obs_flag = False
         all_new_obs = []
         traversed_distance = 0.0
                         
-        for _ in range(steps): #set plotting Hz
+        for step_idx in range(steps): #set plotting Hz
             
             if self.s_bot.cost_to_goal == np.inf:
                 self.robot_path_to_goal = False
@@ -538,19 +513,13 @@ class RRTX:
                 # print(self.s_bot.lmc)
                 # print(self.path)
                 # print(self.s_bot.parent)
-            
-            
-            # # update robot position
-            # run_time = time.time() - start_time
+                
+            if self.contingency_triggered:
+                return all_new_obs, new_obs_flag, traversed_distance
         
             # if there is path to goal and run_time > 5s, then start moving the robot
             if self.robot_path_to_goal:
-                # # timing stuff
-                # if first_time:
-                #     prev_time = time.time()
-                #     first_time = False
-                # elapsed_time = time.time() - prev_time
-                # prev_time = time.time()
+
                 
                 #Terminate when reach the goal
                 if self.s_bot.cost_to_goal == 0.0 and self.s_bot.lmc == 0.:
@@ -560,16 +529,8 @@ class RRTX:
                 self.robot_state = self.utils.update_robot_position_dubins(self.robot_state, [self.s_bot.parent.x, self.s_bot.parent.y], 0.01, v=self.robot_speed)
                 self.robot_position = self.robot_state[:2]
                 
-                #Convert current robot's attitude to indices (slice of the reachable set)
-                self.theta_slice = np.argmin(np.abs(self.hjr_fno.theta_array - (self.robot_state[2] % (2*np.pi))))
-                
-                
-                
-                # TODO time_slice would only update when we start contingency planning
-                # self.time_slice = np.argmin(np.abs(self.hjr_fno.time_array - self.Tf_reach))
-                
                 # Lidar radial detection of the obstacles
-                self.unknown_obs_circle, detected_obs = self.utils.lidar_detected(self.robot_position, sensing_radius=self.lidar_range)
+                self.unknown_obs_circle, detected_obs = self.utils.lidar_detected(self.robot_position)
                 # NOTE self.unknown_obs_circle == self.env.unknown_obs_circle == self.utils.unknown_obs_circle
                 # self.plotting.unknwown_obs_circle must be updated independently >>> implement this in RRTX.update_obstacles()
                 
@@ -585,95 +546,28 @@ class RRTX:
                     
                     # TODO update HJB reachable set with the detected_obs here
                     exec_time_start = time.time()
-                    self.hjr_fno.update_obs(detected_obs)
-                    print("Update Reachable set:", time.time() - exec_time_start, "s")
+                    
+                    if self.HJ_contingency_enable:
+                        self.hjr_fno.update_obs(detected_obs)
+                        print("Update Reachable set:", time.time() - exec_time_start, "s")
                     
                     # update known obstacles withint the environment
                     for obs in detected_obs:
                         self.update_obstacles(obs, robots_plan=True)
-                    
-                 
                 
-                    
-                                    
-                # As the robot propagates (agnostic to its dynamics), 
-                # Check if the robot is close enough to the its parent node,
-                # If so, then set the parent node as the current node associated with the robot (i.e., s_bot)
-                #
-                # NOTE: - The tree is rooted at the goal
-                #       - Each node’s parent is closer to the goal
-                #       - Following parents walks the path backward along the tree
-                
-                
-                # update node that robot is "at"
+                # update node that robot is currently at
                 if self.s_bot.parent is not None:
                     if math.hypot(self.robot_position[0] - self.s_bot.parent.x,
                                 self.robot_position[1] - self.s_bot.parent.y) < 0.5:
                         
                         traversed_distance += self.s_bot.distance(self.s_bot.parent)
                         self.s_bot = self.s_bot.parent
-                    # self.other_goals[self.curr_tree_idx] = self.s_bot
-                
-            '''  
-            # animate
-            if run_time > 2 or run_time < 0.01:
-
-                # only update the plot at 5 Hz
-                elapsed_plotting = time.time() - prev_plotting
-                if elapsed_plotting >= 0.2:
-                    prev_plotting = time.time()
-                    self.edges = []
-                    for node in self.tree_nodes:
-                        if node.parent:
-                            self.edges.append(np.array([[node.parent.x, node.parent.y], [node.x, node.y]]))
-                   
-                   
-                    
-                    # ================= PLOTTING =======================
-                                        
-                    # clear axes
-                    self.ax.clear()
-
-                    # restore static axis properties
-                    self.ax.set_xlim(self.env.x_range[0], self.env.x_range[1] + 1)
-                    self.ax.set_ylim(self.env.y_range[0], self.env.y_range[1] + 1)
-
-                    # draw environment
-                    self.plotting.plot_env(self.ax)
-
-                    # draw tree nodes
-                    if self.all_nodes_coor:
-                        nodes = np.array(self.all_nodes_coor)
-                        self.ax.scatter(nodes[:, 0], nodes[:, 1], s=4, c='gray', alpha=0.5)
-
-                    # draw tree edges
-                    if self.edges:
-                        edge_col = LineCollection(self.edges, colors='blue', linewidths=0.5, alpha=0.5)
-                        self.ax.add_collection(edge_col)
-
-                    # draw path to goal
-                    if self.path:
-                        path_col = LineCollection(self.path, colors='red', linewidths=1.0)
-                        self.ax.add_collection(path_col)
-
-                    # draw robot + lidar
-                    self.plotting.plot_robot(self.ax, self.robot_position, self.lidar_range)
-                    
-                    # plot reachable set at current heading
-                    self.plotting.plot_reachable_set(self.ax, self.hjr_fno, self.theta_slice, self.time_slice)
-
-                    # force redraw
-                    plt.pause(0.001)
-                    
-                    # ================= END OF PLOTTING =======================
-            '''
-
-            
+                        
+            ''' Expand the tree for more optimal path'''            
             self.search_radius = self.shrinking_ball_radius()
             
-
             if np.random.random() < self.prob_q:
-             
+            
                 v = self.random_node()
                 
             else:
@@ -691,7 +585,7 @@ class RRTX:
                     
                     v = self.random_node()
                 
-                         
+                        
             v_nearest = self.nearest(v)
             v = self.saturate(v_nearest, v)
                 
@@ -710,6 +604,12 @@ class RRTX:
             for j, goal_j in enumerate(self.other_goals):
                 if goal_j.cost_to_goal < np.inf:
                     self.path_to_goal[j] = True
+                    
+            # Allow matplotlib to process events (including mouse clicks)
+            # This is crucial for the click handler to work
+            if step_idx % 10 == 0:  # Still skip some iterations
+                self.fig.canvas.flush_events()
+                
                 
         return all_new_obs, new_obs_flag, traversed_distance
 
@@ -772,9 +672,6 @@ class RRTX:
         self.plotting.update_obs(self.obs_circle, self.obs_boundary, self.obs_rectangle, self.unknown_obs_circle) # for plotting obstacles
         self.utils.update_obs(self.obs_circle, self.obs_boundary, self.obs_rectangle, self.unknown_obs_circle) # for collision checking
         self.update_gamma() # free space volume changed, so gamma must change too
-
-        # Get all edges that intersect the new circle obstacle
-        # E_O = [(v, u) for v in self.tree_nodes if (u:=v.parent) and self.utils.is_intersect_circle(*self.utils.get_ray(v, u), obs[:2], obs[2])]
         
         # NOTE Collect all directed node pair (v->u) that intersects with the obstacles
         #
@@ -782,7 +679,8 @@ class RRTX:
         #       for all nodes 'u' in neighborhood of 'v' (include static and running nodes)
         #               check if the edge v -> u intersected with 
         E_O = [(v, u) 
-                for v in self.tree_nodes
+                # for v in self.tree_nodes
+                for v in self.kd_tree.search_nn_dist((obs[0], obs[1]), obs[2] + self.search_radius)
                     for u in v.all_out_neighbors() 
                         if self.utils.is_intersect_circle(*self.utils.get_ray(v, u), obs[:2], obs[2])] # or not self.is_feasible_ray(v,u)]
         
@@ -1036,26 +934,29 @@ class RRTX:
         
         #------------------------
         
-        # uniform random Node inside the env space
+        # uniform random Node inside the env space (if HJ contingency is disabled)
         
-        # return Node((np.random.uniform(self.x_range[0] + delta, self.x_range[1] - delta),
-        #             np.random.uniform(self.y_range[0] + delta, self.y_range[1] - delta)))
+        if not self.HJ_contingency_enable:
+            return Node((np.random.uniform(self.x_range[0] + delta, self.x_range[1] - delta),
+                        np.random.uniform(self.y_range[0] + delta, self.y_range[1] - delta)))
         
         #------------------------
         
-        #multi gaussian distribution
         
-        # Choose which Gaussian to sample from
-        idx = np.random.randint(len(self.safe_regions))
-        x, y, _ = self.safe_regions[idx]
-        mu = np.array([x, y])
+        else:
+            #multi gaussian distribution
+            
+            # Choose which Gaussian to sample from
+            idx = np.random.randint(len(self.safe_regions))
+            x, y, _ = self.safe_regions[idx]
+            mu = np.array([x, y])
 
-        # Isotropic covariance
-        sigma = 5.5
-        cov = sigma**2 * np.eye(2)
+            # Isotropic covariance
+            sigma = 5.5
+            cov = sigma**2 * np.eye(2)
 
-        sample = np.random.multivariate_normal(mu, cov)
-        return Node((sample[0], sample[1]))
+            sample = np.random.multivariate_normal(mu, cov)
+            return Node((sample[0], sample[1]))
 
     def update_gamma(self):
         '''
@@ -1115,11 +1016,22 @@ class RRTX:
     def is_feasible_ray(self, start:Node, end:Node):
         
         o, d = self.utils.get_ray(start, end)
-                        
+        
+        ''' Use query from HJR-FNO model to check feasibility of the ray (however, expensive beacuse we need spatial size of at least 32)'''
+        # #crate batch size of 16 based on start and end nodes
+        # # query the value of HJ reachable set from HJR-FNO
+        # t_vals = np.linspace(0, 1, 32)
+        # theta_array = self.robot_state[2] + np.array([-np.pi/4, 0.0, np.pi/4])
+
+        # positions = o + t_vals[:, None] * d                  # (32, 2)
+        # feasible =  self.hjr_fno.is_state_feasible(robot_state= positions, theta_array=theta_array, reachable_set_constraint=self.HJ_contingency_enable)
+        # return feasible
+
+        # NOTE old method, using look up table of predicted HJ reachable set
+        
         for t in np.linspace(0,1,3):
-            shot = Node((o[0] + t * d[0], o[1] + t * d[1]))
             
-            if not self.hjr_fno.is_feasible(shot, self.theta_slice, self.time_slice):
+            if not self.hjr_fno.is_feasible(v= (o[0] + t * d[0], o[1] + t * d[1]) , reachable_set_constraint=self.HJ_contingency_enable):
                 return False
 
         return True
@@ -1145,9 +1057,10 @@ Space Filling Forest (SFF*) Algorithm (modified with RRTX)
 Paper: "Multi-Goal Path Planning Using Multiple Random Trees" (Janoš et al., 2021)
 '''
 class SFF_star:
+    
     def __init__(
         self,
-        x_start: Tuple[float, float],
+        start_goal_index: int,
         x_goal: List,
         heading: float,
         lidar_range: float,
@@ -1159,7 +1072,12 @@ class SFF_star:
         safe_regions: List[Sequence[float]],
         ) -> None:
         
+        from HJR_FNO.HJR_FNO import HJR_FNO
         
+        assert start_goal_index < len(x_goal), "start_goal_index index out of range"
+        
+        self.start_goal_index = start_goal_index
+        x_start = x_goal[start_goal_index]
         self.iter_max = iter_max
         
         self.env = env.Env(safe_regions=safe_regions)
@@ -1167,15 +1085,23 @@ class SFF_star:
         
         #HJR-FNO configs
         self.Tf_reach = 7.5 #must be less than 8s (underapproximation of the training data)
-        self.hjr_fno = HJR_FNO(safe_regions=safe_regions, Tf_reach=self.Tf_reach)
+        self.hjr_fno = HJR_FNO(env=self.env, safe_regions=safe_regions, Tf_reach=self.Tf_reach)
+        self.current_state = [x_start[0], x_start[1], heading]
+        self.HJ_contingency_enable = False  #enable contingency constraint in RRTX tree planning
 
         # plotting
         self.fig, self.ax = plt.subplots(figsize=(8, 8))
         self.fig.suptitle(f"HJR-FNO Contingency")
         self.ax.set_xlim(self.env.x_range[0], self.env.x_range[1]+1)
-        self.ax.set_ylim(self.env.y_range[0], self.env.y_range[1]+1)      
+        self.ax.set_ylim(self.env.y_range[0], self.env.y_range[1]+1)    
         
         self.show_subplots = False
+        
+        # Add flags for click handling
+        self.waiting_for_first_click = False
+        self.waiting_for_second_click = False
+        self.contingency_complete = False
+        self.resume_planning = False  # Signal to restart the plan_iter loop
 
         #Define different tree branches rooted at each target location
         self.rrtx_trees = {}
@@ -1203,12 +1129,12 @@ class SFF_star:
                 iter_max=iter_list[i],
                 safe_regions=safe_regions,
                 hjr_fno=self.hjr_fno,
+                HJ_contingency_enable=self.HJ_contingency_enable,
                 fig= self.fig,
                 ax= self.ax,
-                plotting=self.plotting
+                plotting=self.plotting,
             )
-    
-        
+            
         # Define distance matrix 
         # D_ij means i-th tree distance to j-th goal; if optimal path is not found, D_ij = np.inf
         self.D = np.full((self.n_tree, self.n_tree), np.inf)
@@ -1219,7 +1145,19 @@ class SFF_star:
         cmap = plt.get_cmap("hsv")
         self.colorList = [cmap(i) for i in np.linspace(0, 1, len(x_goal), endpoint=False)]
         
-
+    def on_click(self, event):
+        """Handle mouse click events for contingency planning."""
+        if event.inaxes != self.ax:
+            return
+        
+        if self.HJ_contingency_enable:
+            print("Adversary detected!")
+        
+            for tree_k in self.rrtx_trees.values():
+                tree_k.contingency_triggered = True
+        else:
+            print("Contingency constraint disabled. No action taken.")
+        
     def update_distance_matrix(self, pattern=None, print_flag=True, precision=3):
                 
                 
@@ -1277,17 +1215,6 @@ class SFF_star:
 
         self.D = D_pat
         
-        ''' 
-        # OLD CODE: default pattern (full matrix)
-        
-        #append updated value to the distance matrix
-        for i, tree_i in self.rrtx_trees.items():
-            for local_j, global_j in enumerate(tree_i.other_goals_id):
-                # if tree_i.path_to_goal[local_j]:
-                self.D[i, global_j] = tree_i.other_goals[local_j].cost_to_goal
-                    # print(f"index {(i, global_j)}, cost: {tree_i.other_goals[local_j].lmc}")
-        '''     
-        
         if print_flag:
             self.print_distance_matrix(pattern=pattern, precision=precision)
             
@@ -1337,7 +1264,7 @@ class SFF_star:
         _atsp = atsp.SA(D_int.tolist(), learning_plot=learning_plot, silent_mode=silent_mode)
         return _atsp.solve()
     
-    def solve_atsp_held_karp(self, distance_matrix, start=0):
+    def solve_atsp_held_karp(self, distance_matrix, start=[0], hamiltonian_cycle=True):
         """
         Solve an Asymmetric TSP directly from a distance matrix using Simulated Annealing.
 
@@ -1345,8 +1272,12 @@ class SFF_star:
         -------
         solution, cost
         """
+        
+        if type(start) == int:
+            start = [start]
+        assert type(start) == list, "start must be an integer or a list of integers"
 
-        return atsp.held_karp(cost=distance_matrix.tolist() , prefix=start)
+        return atsp.held_karp(cost=distance_matrix.tolist() , prefix=start, hamiltonian_cycle=hamiltonian_cycle)
     
     def compute_tour_distance(
         self,
@@ -1415,76 +1346,76 @@ class SFF_star:
         idx = tour.index(start_id)
         rotated = tour[idx:] + tour[:idx] + [start_id]
         return rotated
+        
+    def init_trees(self):        
 
-
-        
-    def planning(self):
-        
-        iter = 0
-        prev_plotting = time.time()
-        
-        
         for i in range(self.n_tree):
             
             print(f"Initialize the tree {i}")
         
             self.rrtx_trees[i].planning()
             
-            # only update the plot at 5 Hz
-            elapsed_plotting = time.time() - prev_plotting
-            if elapsed_plotting >= 0.2:
-                prev_plotting = time.time()
                 
+            # ================= PLOTTING =======================
+                                        
+            # clear axes
+            self.ax.clear()
             
-                # ================= PLOTTING =======================
-                                            
-                # clear axes
-                self.ax.clear()
+            # restore static axis properties
+            self.ax.set_xlim(self.env.x_range[0], self.env.x_range[1] + 1)
+            self.ax.set_ylim(self.env.y_range[0], self.env.y_range[1] + 1)
+
+            # draw environment
+            self.plotting.plot_env(self.ax, colorList=self.colorList)
+
+            for i, tree_i in self.rrtx_trees.items():
                 
-                # restore static axis properties
-                self.ax.set_xlim(self.env.x_range[0], self.env.x_range[1] + 1)
-                self.ax.set_ylim(self.env.y_range[0], self.env.y_range[1] + 1)
-
-                # draw environment
-                self.plotting.plot_env(self.ax, colorList=self.colorList)
-
-                for i, tree_i in enumerate(self.rrtx_trees.values()):
+                # draw tree nodes
+                if tree_i.all_nodes_coor:
+                    nodes = np.array(tree_i.all_nodes_coor)
+                    self.ax.scatter(nodes[:, 0], nodes[:, 1], s=4, c='gray', alpha=0.5)
                     
-                    
-                    # draw tree nodes
-                    if tree_i.all_nodes_coor:
-                        nodes = np.array(tree_i.all_nodes_coor)
-                        self.ax.scatter(nodes[:, 0], nodes[:, 1], s=4, c='gray', alpha=0.5)
-                        
-                    #get all edges
-                    self.edges = []
-                    for node in tree_i.tree_nodes:
-                        if node.parent:
-                            self.edges.append(np.array([[node.parent.x, node.parent.y], [node.x, node.y]]))
-            
-                    # draw tree edges
-                    if self.edges:
-                        edge_col = LineCollection(self.edges, colors=self.colorList[i], linewidths=0.5, alpha=0.2)
-                        self.ax.add_collection(edge_col)
+                #get all edges
+                self.edges = []
+                for node in tree_i.tree_nodes:
+                    if node.parent:
+                        self.edges.append(np.array([[node.parent.x, node.parent.y], [node.x, node.y]]))
+        
+                # draw tree edges
+                if self.edges:
+                    edge_col = LineCollection(self.edges, colors=self.colorList[i], linewidths=0.5, alpha=0.2)
+                    self.ax.add_collection(edge_col)
 
-                    # draw path to goal
-                    for j, goal_j in enumerate(tree_i.other_goals):
-                        if tree_i.path_to_goal[j]:
-                            path_col = LineCollection(tree_i.multi_paths[j], colors=self.colorList[i], linewidths=2.5)
-                            self.ax.add_collection(path_col)
-                    
-                    # plot reachable set at current heading
-                    self.plotting.plot_reachable_set(self.ax, self.hjr_fno, tree_i.theta_slice, tree_i.time_slice)
+                # draw path to goal
+                for j, goal_j in enumerate(tree_i.other_goals):
+                    if tree_i.path_to_goal[j]:
+                        path_col = LineCollection(tree_i.multi_paths[j], colors=self.colorList[i], linewidths=2.5)
+                        self.ax.add_collection(path_col)
+                
+                # plot reachable set at current heading
+                if self.HJ_contingency_enable:
+                    self.plotting.plot_reachable_set(self.ax, self.hjr_fno, theta=tree_i.robot_state[2], time=tree_i.Tf_reach)
 
                 # force redraw
                 plt.pause(0.001)
             
                 # ================= END OF PLOTTING =======================
-            
-    
+                
+        
+    def planning(self, hamiltonian_cycle=False):
+        
+        '''
+        Planning using TSP-RRTX with Contingency Handling
+        
+        if hamiltonian_cycle = True, the tour will return to the starting target
+        otherwise, it will only visit each target once
+        '''
         
         
-        #TODO Asymmetric TSP solver to get the optimal visiting sequence
+        #-----------------
+        # Solve initial TSP tour
+        # ----------------
+        
         self.update_distance_matrix() #update self.D
         
         '''
@@ -1506,51 +1437,77 @@ class SFF_star:
         '''
         Held-Karp Algorithm
         '''
-        start = 0 #choose starting target id
-        prev_id = start
+        prev_id = self.start_goal_index
         
-        min_cost, optimal_tour = self.solve_atsp_held_karp(distance_matrix=self.D, start=[start])
+        min_cost, optimal_tour = self.solve_atsp_held_karp(distance_matrix=self.D, start=self.start_goal_index, hamiltonian_cycle=hamiltonian_cycle)
         print('\nOPTIMIZED COST:', min_cost)
         print('Optimal Tour (target_id): ', optimal_tour )
-        
-        
-        # print("cost for [0 2 3 4 1 0]:", self.compute_tour_distance([0, 2, 3, 4, 1, 0]))
-        
+                
         sequence_to_visit = optimal_tour.copy() #this will change to reflect remaining sequence to visit targets
         sequence_visited = []
         sequence_visited.append(sequence_to_visit.pop(0)) #remove the starting target from the remaining sequence
-        original_tour = optimal_tour.copy()
+        
+        original_tour = optimal_tour.copy() #Store original tour to observe changes later
+        
+        #-----------------
+        # Set robot states
+        # ----------------
 
         #Set robot position to the first target location of the routing sequence
         heading = 0.0
-        current_state = [self.rrtx_trees[prev_id].s_goal.x, self.rrtx_trees[prev_id].s_goal.y, heading]
-
-        self.fig.suptitle(f"HJR-FNO Contingency\nOptimal Tour: {optimal_tour}\nVisited: {sequence_visited}\nTo Visit: {sequence_to_visit}")
-
+        self.current_state = [self.rrtx_trees[prev_id].s_goal.x, self.rrtx_trees[prev_id].s_goal.y, heading]
+        
         # Simulate Robot's plan
         print("\nInitilize robot position for each tree")
         
         for i in range(self.n_tree):
             
-            self.rrtx_trees[i].reset_robot_v2(current_state=current_state)
-            # print(self.rrtx_trees[i].s_bot)
-            # print(self.rrtx_trees[i].robot_path_to_goal)
+            self.rrtx_trees[i].reset_robot_v2(current_state=self.current_state)            
+            self.rrtx_trees[i].prob_q = 0.9
             
-            self.rrtx_trees[i].prob_q = 0.8
+        #Add mouse click event handler (resemble adversarial event) which triggers Contingency planning
+        self.cid = self.fig.canvas.mpl_connect('button_press_event', self.on_click) 
+        self.fig.suptitle(f"HJR-FNO Contingency\nOptimal Tour: {optimal_tour}\nVisited: {sequence_visited}\nTo Visit: {sequence_to_visit}")
+        prev_plotting = time.time()
+            
+            
+        #-----------------
+        # Main Planning loop
+        # TSP-RRTX with Contingency Handling
+        # ----------------
             
         print("Start Robot's Plan Execution")
-        
+                
         for i in range(1, len(optimal_tour)):
             
             traversed_distance = 0.0
             
             for plan_iter in range(self.iter_max):
                 
+                # # ========== NEW: Check if waiting for clicks ==========
+                # # If contingency is running, keep processing events until done
+                # while self.waiting_for_first_click:
+                #     self.fig.canvas.flush_events()
+                #     plt.pause(0.01)
+                
+                # # If contingency is done, wait for second click before proceeding
+                # while self.waiting_for_second_click:
+                #     self.fig.canvas.flush_events()
+                #     plt.pause(0.01)
+                
+                # # After second click, restart this plan_iter loop from the beginning
+                # if self.resume_planning:
+                #     print("Restarting planning iteration after contingency...")
+                #     self.resume_planning = False
+                #     continue  # Restart from top of plan_iter loop
+                # # ========== END NEW CODE ==========
+                
+    
                 id = optimal_tour[i]
             
                 if plan_iter == 0:
                     #set the current_state to the previous target location                                    
-                    self.rrtx_trees[id].reset_robot_v2(current_state=current_state)
+                    self.rrtx_trees[id].reset_robot_v2(current_state=self.current_state)
                     self.rrtx_trees[id].update_robot_heading()
                                             
                     print("====================================================\n")
@@ -1560,33 +1517,74 @@ class SFF_star:
                 #if path exists, then execute robot's plan
                 if self.rrtx_trees[id].robot_path_to_goal:
                             
-                    all_new_obs, new_obs_flag, distance = self.rrtx_trees[id].planning_with_robot(steps=10) #propagate 10 steps
-                    traversed_distance += distance
+                    new_obs, new_obs_flag, distance_moved = self.rrtx_trees[id].planning_with_robot(steps=10) #propagate 10 steps
+                    traversed_distance += distance_moved
                     
-                    current_state = self.rrtx_trees[id].robot_state
+                    self.current_state = self.rrtx_trees[id].robot_state
                     
                 #otherwise, keep replanning until path is found
                 else:
                     
-                    self.rrtx_trees[id].reset_robot_v2(current_state=current_state)
+                    self.rrtx_trees[id].reset_robot_v2(current_state=self.current_state)
                     self.rrtx_trees[id].update_robot_heading()
                     continue
                 
+                
+                '''
+                Handling contingency during robot's plan execution
+                '''
+                if self.rrtx_trees[id].contingency_triggered and self.HJ_contingency_enable:
+                    
+                    detected_obs_during_contingency, contingency_trajectory = self.hjr_fno.contingency_policy(
+                            self.current_state, 
+                            self.plotting, 
+                            self.fig, 
+                            self.ax
+                    )
+                    
+                    #Update state and traversed distance so far
+                    self.current_state = contingency_trajectory[-1]
+                    
+                    for traj_i in range(len(contingency_trajectory) - 1):
+                        x0, y0, _ = contingency_trajectory[traj_i]
+                        x1, y1, _ = contingency_trajectory[traj_i + 1]
+                        traversed_distance += np.hypot(x1 - x0, y1 - y0)
+                    
+                    if len(detected_obs_during_contingency) > 0:
+                        new_obs += detected_obs_during_contingency
+                        
+                        #For the current tree, update only new obstacles detected during contingency
+                        for obs in detected_obs_during_contingency:
+                            self.rrtx_trees[id].update_obstacles(obs, robots_plan=True)
+                            
+                    #Reset robot position in the current tree                                    
+                    self.rrtx_trees[id].reset_robot_v2(current_state=self.current_state)
+                    self.rrtx_trees[id].update_robot_heading()
+                            
+                    #Reset the contingency trigger flag
+                    for tree_k in self.rrtx_trees.values():
+                        tree_k.contingency_triggered = False
+                    
+                
+                '''
+                For all new obstacles detected during robot's plan execution/contingency plan
+                - Update all other trees with the new obstacles and rewire if necessary
+                '''    
                 #if there is new obstacle found, optimal routing might changes
                 if new_obs_flag:
-                    
+                                                            
                     updateObs_time_start = time.time()
                     
                     # Update: the path of k-th tree with the 'id'-target being current robot's position
-                    for k, tree_k in enumerate(self.rrtx_trees.values()):
+                    for k, tree_k in self.rrtx_trees.items():
                         
                         # print("================")
                         # print("update tree", k)
                         # print("current search radius", tree_k.search_radius)
                         # print("================")
                         
-                        # NOTE rrtx_trees[id] is already updated inside the planning_with_robot
-                        # TODO Here, we ignore replanning tree which is already visited or currently being visited
+                        # Skip replanning for trees which is currently being visited (already rewired inside planning_with_robot)
+                        # and trees that have already been visited in this tour
                         if k == id or (len(sequence_visited) > 1 and k in sequence_visited[1:]):
                             
                             # print(f"Robot's path to target #{k} exist? {tree_k.robot_path_to_goal}")
@@ -1597,13 +1595,13 @@ class SFF_star:
                             continue
 
                         #reset robot position in the other trees
-                        tree_k.reset_robot_v2(current_state=current_state)
+                        tree_k.reset_robot_v2(current_state=self.current_state)
                         
                         # ----------------- Update Obstacles in other trees -----------------
                         #NOTE Below is the same as updated_obstacle() function in RRTX class
                         
                         # This is similar to RRTX.updated_obstacle() but here we are updating all paths between targets + robot's current pose, rather than just the path to the robot 
-                        for obs in all_new_obs:
+                        for obs in new_obs:
                             
                             #Update list of obstacle and unknown obstacles in RRTX.utils.obs == RRTX.env.obs == RRTX.obs
                             #NOTE since RRTX.plotting is shared globally, the obs and unknown_obs is already updated during the rrtx_trees[id].planning_with_robot
@@ -1614,7 +1612,8 @@ class SFF_star:
                             tree_k.update_gamma() # free space volume changed, so gamma must change too
                             
                             E_O = [(v, u) 
-                                    for v in tree_k.tree_nodes
+                                    # for v in tree_k.tree_nodes
+                                    for v in tree_k.kd_tree.search_nn_dist((obs[0], obs[1]), obs[2] + tree_k.search_radius)
                                         for u in v.all_out_neighbors() 
                                             if tree_k.utils.is_intersect_circle(*tree_k.utils.get_ray(v, u), obs[:2], obs[2])]
                             #
@@ -1637,7 +1636,7 @@ class SFF_star:
                         
                         for goal_j in tree_k.other_goals:
                             tree_k.verify_queue(goal_j)
-                                                          
+                                                        
                         tree_k.reduce_inconsistency(robots_plan=True)
                         
                         # ----------------- End of Update Obstacles in other trees -----------------
@@ -1671,11 +1670,11 @@ class SFF_star:
                     
                     print(f"\nRewire other trees: {time.time() - updateObs_time_start} s\n")
                         
-                        
+
                         
                     # ----------------- Solve ATSP again -----------------
                     
-                    if len(sequence_to_visit[:-1]) >= 2: 
+                    if (hamiltonian_cycle and len(sequence_to_visit[:-1]) >= 2) or (not hamiltonian_cycle and len(sequence_to_visit) >= 2): 
                     #Held-Karp needs at least 2 targets to optimize (excluding the final target of the tour that we must return back to)
                         
                         '''
@@ -1691,11 +1690,22 @@ class SFF_star:
                             self.D[prev_id, tmp_id] = traversed_distance + self.rrtx_trees[tmp_id].s_bot.cost_to_goal   
                         self.print_distance_matrix(precision=3)                     
                         
-                        min_cost, optimal_tour = self.solve_atsp_held_karp(distance_matrix=self.D, start=sequence_visited)
+                        min_cost, new_tour = self.solve_atsp_held_karp(distance_matrix=self.D, start=sequence_visited, hamiltonian_cycle=hamiltonian_cycle)
                         
-                        sequence_to_visit = optimal_tour.copy()
-                        sequence_visited = sequence_to_visit[:i]
-                        sequence_to_visit = sequence_to_visit[i:]
+                        if len(new_tour) == self.n_tree:
+                            
+                            if new_tour != optimal_tour:
+                                plan_iter = 0 #reset plan_iter to 0 to replan toward the new target in the new sequence
+                                print("\nNew optimal tour found after replanning due to new obstacles!")
+                                
+                            optimal_tour = new_tour
+                        
+                            sequence_to_visit = optimal_tour.copy()
+                            sequence_visited = sequence_to_visit[:i]
+                            sequence_to_visit = sequence_to_visit[i:]
+                        else:
+                            print("Held-Karp failed to find a new optimal tour")
+                            
                         '''
                         [Ignored] Simulated Annealing
                         '''
@@ -1738,13 +1748,14 @@ class SFF_star:
 
                     # ----------------- End of solve ATSP  ---------------
                         
+                    
                 
                 # only update the plot at 5 Hz
                 elapsed_plotting = time.time() - prev_plotting
                 if elapsed_plotting >= 0.2:
                     prev_plotting = time.time()
                 
-                    # ====continue============= PLOTTING =======================
+                    # ========================= PLOTTING =======================
                                                 
                     # clear axes
                     self.ax.clear()
@@ -1784,7 +1795,8 @@ class SFF_star:
                     self.plotting.plot_robot(self.ax, self.rrtx_trees[id].robot_position, self.rrtx_trees[id].lidar_range)
                     
                     # plot reachable set at current heading
-                    self.plotting.plot_reachable_set(self.ax, self.hjr_fno, self.rrtx_trees[id].theta_slice, self.rrtx_trees[id].time_slice)
+                    if self.HJ_contingency_enable:
+                        self.plotting.plot_reachable_set(self.ax, self.hjr_fno, self.rrtx_trees[id].robot_state[2], self.rrtx_trees[id].Tf_reach)
                     
                     
                     if new_obs_flag and  self.show_subplots:
@@ -1801,7 +1813,8 @@ class SFF_star:
                             ax.set_ylim(self.env.y_range[0], self.env.y_range[1] + 1)
                             self.plotting.plot_env(ax, colorList=self.colorList)     
                             self.plotting.plot_robot(ax, self.rrtx_trees[id].robot_position, self.rrtx_trees[id].lidar_range)
-                            self.plotting.plot_reachable_set(ax, self.hjr_fno, self.rrtx_trees[id].theta_slice, self.rrtx_trees[id].time_slice)
+                            if self.HJ_contingency_enable:
+                                self.plotting.plot_reachable_set(ax, self.hjr_fno, self.rrtx_trees[id].robot_state[2], self.rrtx_trees[id].Tf_reach)
                                                 
                             # draw path to goal
                             for j in range(len(self.rrtx_trees[k].other_goals)):
@@ -1831,11 +1844,8 @@ class SFF_star:
                                 ax.add_collection(edge_col)
 
                         
-                            plt.pause(0.001)
-                    else:
-
-                        # force redraw
-                        plt.pause(0.001)
+                    # force redraw
+                    plt.pause(0.001)
                     
                     # ================= END OF PLOTTING =======================
                     
@@ -1843,7 +1853,7 @@ class SFF_star:
                     
                     #Print new distance matrix between each goals after replanning
                     print("\n")
-                    for k, tree_k in enumerate(self.rrtx_trees.values()):
+                    for k, tree_k in self.rrtx_trees.items():
                         print(f"Tree {k} robot's cost to goal: {tree_k.s_bot.cost_to_goal}, Reachable? {tree_k.robot_path_to_goal}")
                     print("\n")
                     
@@ -1856,14 +1866,17 @@ class SFF_star:
                     print("Successfully reach the goal!")
                     break
                 
+                    
             ###### END OF PLANNING LOOP FROM prev_id TO id ######
                 
             prev_id = id
-            current_state = self.rrtx_trees[id].robot_state
+            self.current_state = self.rrtx_trees[id].robot_state
             heading = self.rrtx_trees[id].robot_state[2]
             sequence_visited.append(sequence_to_visit.pop(0))  #remove the reached target from the sequence
             
         ###### END OF FOR LOOP THROUGH OPTIMAL TOUR ######
+        
+        
         print('\Final Tour (target_id): ' , optimal_tour)
         print('Final Tour cost', self.compute_tour_distance(optimal_tour))
         
@@ -1873,7 +1886,7 @@ class SFF_star:
         print("Tour Completed!")
 
 def main():
-    x_start = (-20, 23, 0)  # Starting node
+    x_start = (-18, 23, 0)  # Starting node
     x_goal = [(-18, 23),  (-11, -17),  (5, 12), (15, 20), (15,-15)]  # Goal node
     #                      (-5, -1)
     # x_goal = [(-20, 23), (15,-15)]  # Goal node
@@ -1881,7 +1894,7 @@ def main():
 
 
     sff = SFF_star(
-        x_start=x_start, 
+        start_goal_index=0, 
         x_goal=x_goal, 
         heading=0.0,
         lidar_range=5.5,
@@ -1899,6 +1912,8 @@ def main():
                       [18,-12,2],
                       [-15,23,2]],
         )
+    
+    sff.init_trees()
     sff.planning()
     
 
@@ -1908,6 +1923,11 @@ if __name__ == '__main__':
 
 '''
 TODO:
+-  Benchmark for the case, where the contingecy safe set is not a constraint any more
+- For Held-Karp Algorithm, implement the case where the we dont have to return to the starting point
+- is_state_feasible() directly use HJR-FNO to check feasibility instead of table look up
+
+
 - ATSP doesnt return the optimal tour sometimes (maybe due to the SA parameters)
 - robot_path_to_goal flag not updated correctly after replanning with new obstacles (cause error because the robot plan to move while there is no path to goal)
 - Implement remove_obstacles function in RRTX class

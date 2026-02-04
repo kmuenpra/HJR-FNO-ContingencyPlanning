@@ -26,6 +26,8 @@ class Utils:
         self.obs_rectangle = self.env.obs_rectangle
         self.obs_boundary = self.env.obs_boundary
         self.unknown_obs_circle = self.env.unknown_obs_circle
+        
+        self.sensing_radius = 2.0
 
     def update_obs(self, obs_cir, obs_bound, obs_rec, unknown_obs_cir):
         self.obs_circle = obs_cir
@@ -198,7 +200,7 @@ class Utils:
         return [x_new, y_new, theta_new % (2 * math.pi)] #return theta in domain [0, 2pi]
         
     
-    def lidar_detected(self, robot_position, sensing_radius=2.0):
+    def lidar_detected(self, robot_position):
         """
         @description 
         Simulate a circular lidar sensor. 
@@ -227,7 +229,7 @@ class Utils:
         d = np.sqrt((obs[:, 0] - x_r)**2 + (obs[:, 1] - y_r)**2)
 
         # Detection condition
-        detected_mask = np.abs(d - sensing_radius) <= (obs[:, 2] / 3.0)
+        detected_mask = np.abs(d - self.sensing_radius) <= (obs[:, 2] / 3.0)
 
         if not np.any(detected_mask):
             return self.unknown_obs_circle, []

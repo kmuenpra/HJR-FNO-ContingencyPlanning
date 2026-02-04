@@ -2,12 +2,13 @@
 Plotting tools for Sampling-based algorithms
 @author: huiming zhou
 """
-
-import matplotlib.pyplot as plt
-import matplotlib.patches as patches
 import os
 import sys
+import matplotlib.pyplot as plt
+import matplotlib.patches as patches
 import numpy as np
+from scipy.io import loadmat
+
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) +
                 "/../../Sampling_based_Planning/")
@@ -149,14 +150,19 @@ class Plotting:
 
     def plot_robot(self, ax, robot_position, lidar_range=2.0):
         #robot
-        start_patch = patches.Circle(
-            (robot_position[0], robot_position[1]), 0.5,
-            edgecolor='green',
-            facecolor='green',
-            fill=True
-        )
-        ax.add_patch(start_patch)
-        ax.draw_artist(start_patch)
+        # start_patch = patches.Circle(
+        #     (robot_position[0], robot_position[1]), 0.5,
+        #     edgecolor='green',
+        #     facecolor='green',
+        #     fill=True
+        # )
+        # ax.add_patch(start_patch)
+        # ax.draw_artist(start_patch)
+        
+        ax.plot(robot_position[0], robot_position[1], 
+                   'ro', markersize=5, markerfacecolor='red', 
+                   markeredgecolor='darkred', markeredgewidth=2,
+                   label='Current Position', zorder=6)
         
         #lidar
         lidar_patch = patches.Circle(
@@ -173,23 +179,45 @@ class Plotting:
         ax.draw_artist(lidar_patch)
         
     
-    def plot_reachable_set(self, ax, hjr_fno, theta_slice, time_slice):
-        
+    def plot_reachable_set(self, ax, hjr_fno, theta, time):
         
         for i in range(hjr_fno.num_safe_regions):
-            reachable_set = hjr_fno.HJR_sets[i].detach().cpu().numpy()
             
-            reachable_set_slice = reachable_set[...,theta_slice, time_slice]
+            reachable_set = hjr_fno.HJR_sets[i]
             
-            CS = ax.contour(
-                hjr_fno.X + hjr_fno.safe_regions[i][0],
-                hjr_fno.Y + hjr_fno.safe_regions[i][1],
-                reachable_set_slice,
-                levels=[0],
-                colors='magenta',
-                linewidths=2
-            )
-        
+            # If there's no obstacle yet, use exact (pre-computed) reachable set
+            if not hjr_fno.obs_list[i]:
+                
+                theta_slice = np.argmin(np.abs(hjr_fno.theta_array_fine - theta))
+                time_slice = np.argmin(np.abs(hjr_fno.time_array_fine - time))
+                reachable_set_slice = reachable_set[..., theta_slice, time_slice]
+                
+                CS = ax.contour(
+                    hjr_fno.X_fine + hjr_fno.safe_regions[i][0],
+                    hjr_fno.Y_fine + hjr_fno.safe_regions[i][1],
+                    reachable_set_slice,
+                    levels=[0],
+                    colors='magenta',
+                    linewidths=2
+                )
+            
+            #When obstacle appears, use predicted reachable set via Neural Operator
+            else:
+                
+                theta_slice = np.argmin(np.abs(hjr_fno.theta_array - theta))
+                time_slice = np.argmin(np.abs(hjr_fno.time_array - time))
+                
+                reachable_set_slice = reachable_set[...,theta_slice, time_slice].detach().cpu().numpy()
+            
+                CS = ax.contour(
+                    hjr_fno.X + hjr_fno.safe_regions[i][0],
+                    hjr_fno.Y + hjr_fno.safe_regions[i][1],
+                    reachable_set_slice,
+                    levels=[0],
+                    colors='magenta',
+                    linewidths=2
+                )
+            
     
 
     def update_obs(self, obs_cir, obs_bound, obs_rec, unknown_obs):
