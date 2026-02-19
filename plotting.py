@@ -8,6 +8,7 @@ import matplotlib.pyplot as plt
 import matplotlib.patches as patches
 import numpy as np
 from scipy.io import loadmat
+from scipy.ndimage import distance_transform_edt
 
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) +
@@ -196,10 +197,50 @@ class Plotting:
                     hjr_fno.X_fine + hjr_fno.safe_regions[i][0],
                     hjr_fno.Y_fine + hjr_fno.safe_regions[i][1],
                     reachable_set_slice,
-                    levels=[0],
+                    levels=[hjr_fno.safe_margin],
                     colors='magenta',
                     linewidths=2
                 )
+                
+                #Find R_funnel
+                dx = (hjr_fno.grid_max[0] - hjr_fno.grid_min[0]) / (hjr_fno.N_fine[0] - 1)
+                mask = reachable_set_slice <= hjr_fno.safe_margin   # True = feasible
+                dist_field = distance_transform_edt(mask) * dx
+                row = hjr_fno.xs_to_rows(np.array([0]), N=hjr_fno.N_fine).astype(int)
+                col = hjr_fno.ys_to_cols(np.array([0]), N=hjr_fno.N_fine).astype(int)
+                R_star = dist_field[row, col]
+                # print("R_star",R_star)
+                
+                R = float(R_star)   # convert from array to scalar
+                x_c, y_c = hjr_fno.safe_regions[i][:2]
+
+                circle = patches.Circle(
+                    (x_c, y_c),
+                    R,
+                    facecolor='orange',
+                    edgecolor='orange',
+                    alpha=0.4,
+                    linewidth=2
+                )
+                ax.add_patch(circle)
+                
+                # Z_masked = np.ma.masked_where(reachable_set_slice > 0, reachable_set_slice)
+                
+                # X = hjr_fno.X_fine + hjr_fno.safe_regions[i][0]
+                # Y = hjr_fno.Y_fine + hjr_fno.safe_regions[i][1]
+                # Z = Z_masked
+
+                # im = ax.imshow(
+                #     Z,
+                #     extent=[X.min(), X.max(), Y.min(), Y.max()],
+                #     origin='lower',
+                #     cmap="Blues_r",
+                #     vmin=np.min(Z),
+                #     vmax=np.max(Z),
+                #     alpha=0.7
+                # )
+
+
             
             #When obstacle appears, use predicted reachable set via Neural Operator
             else:
@@ -213,10 +254,49 @@ class Plotting:
                     hjr_fno.X + hjr_fno.safe_regions[i][0],
                     hjr_fno.Y + hjr_fno.safe_regions[i][1],
                     reachable_set_slice,
-                    levels=[0],
+                    levels=[hjr_fno.safe_margin],
                     colors='magenta',
                     linewidths=2
                 )
+                
+                
+                
+                #Find R_funnel
+                dx = (hjr_fno.grid_max[0] - hjr_fno.grid_min[0]) / (hjr_fno.N[0] - 1)
+                mask = reachable_set_slice <= hjr_fno.safe_margin   # True = feasible
+                dist_field = distance_transform_edt(mask) * dx
+                row = hjr_fno.xs_to_rows(np.array([0]), N=hjr_fno.N).astype(int)
+                col = hjr_fno.ys_to_cols(np.array([0]), N=hjr_fno.N).astype(int)
+                R_star = dist_field[row, col]
+                # print("R_star",R_star)
+                
+                R = float(R_star)   # convert from array to scalar
+                x_c, y_c = hjr_fno.safe_regions[i][:2]
+
+                circle = patches.Circle(
+                    (x_c, y_c),
+                    R,
+                    facecolor='orange',
+                    edgecolor='orange',
+                    alpha=0.4,
+                    linewidth=2
+                )
+                ax.add_patch(circle)
+                
+                # Z_masked = np.ma.masked_where(reachable_set_slice > 0, reachable_set_slice)
+                # X = hjr_fno.X + hjr_fno.safe_regions[i][0]
+                # Y = hjr_fno.Y + hjr_fno.safe_regions[i][1]
+                # Z = Z_masked
+
+                # im = ax.imshow(
+                #     Z,
+                #     extent=[X.min(), X.max(), Y.min(), Y.max()],
+                #     origin='lower',
+                #     cmap="Blues_r",
+                #     vmin=np.min(Z),
+                #     vmax=np.max(Z),
+                #     alpha=0.7
+                # )
             
     
 

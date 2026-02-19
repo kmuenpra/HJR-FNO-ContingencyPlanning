@@ -21,7 +21,7 @@ class Utils:
     def __init__(self, environment:env.Env):
         self.env = environment
 
-        self.delta = 0.1
+        self.delta = 3
         self.obs_circle = self.env.obs_circle
         self.obs_rectangle = self.env.obs_rectangle
         self.obs_boundary = self.env.obs_boundary
@@ -188,16 +188,24 @@ class Utils:
         dx = dest[0] - x
         dy = dest[1] - y
 
-        desired_theta = math.atan2(dy, dx)
-        heading_error = Utils.wrap_angle(desired_theta - theta)
+        # desired_theta = math.atan2(dy, dx)
+        # heading_error = Utils.wrap_angle(desired_theta - theta)
 
-        omega = max(-w_max, min(w_max, heading_error / dt))
+        # omega = max(-w_max, min(w_max, heading_error / dt))
 
-        theta_new = Utils.wrap_angle(theta + omega * dt)
-        x_new = x + v * dt * math.cos(theta_new)
-        y_new = y + v * dt * math.sin(theta_new)
+        # theta_new = Utils.wrap_angle(theta + omega * dt)
+        # x_new = x + v * dt * math.cos(theta_new)
+        # y_new = y + v * dt * math.sin(theta_new)
+        
+        # return [x_new, y_new, theta_new % (2 * math.pi)] #return theta in domain [0, 2pi]
+        
+        
+        #Unicycle model
+        dist = v * dt
+        angle = math.atan2(dy, dx)
+        return [x + dist * math.cos(angle), y + dist * math.sin(angle), angle]
 
-        return [x_new, y_new, theta_new % (2 * math.pi)] #return theta in domain [0, 2pi]
+        
         
     
     def lidar_detected(self, robot_position):
