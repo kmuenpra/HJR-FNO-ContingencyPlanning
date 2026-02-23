@@ -9,6 +9,7 @@ import matplotlib.patches as patches
 import numpy as np
 from scipy.io import loadmat
 from scipy.ndimage import distance_transform_edt
+import torch
 
 
 sys.path.append(os.path.dirname(os.path.abspath(__file__)) +
@@ -19,9 +20,12 @@ import env
 
 
 class Plotting:
-    def __init__(self, x_start, x_goal, safe_regions=[]):
+    def __init__(self, x_start, x_goal, safe_regions=[], _env=None):
         self.xI, self.xG = x_start, x_goal
-        self.env = env.Env(safe_regions=safe_regions)
+        if _env is None:
+            self.env = env.Env(safe_regions=safe_regions)
+        else:
+            self.env = _env
         self.obs_bound = self.env.obs_boundary
         self.obs_circle = self.env.obs_circle
         self.obs_rectangle = self.env.obs_rectangle
@@ -169,9 +173,9 @@ class Plotting:
         lidar_patch = patches.Circle(
         (robot_position[0], robot_position[1]),
         radius=lidar_range,
-        edgecolor='green',
+        edgecolor='cyan',
         facecolor='none',
-        linestyle='--',
+        linestyle='-',
         linewidth=1.5,
         alpha=0.8,
         zorder=4
@@ -189,6 +193,7 @@ class Plotting:
             # If there's no obstacle yet, use exact (pre-computed) reachable set
             if not hjr_fno.obs_list[i]:
                 
+                '''reachable set'''
                 theta_slice = np.argmin(np.abs(hjr_fno.theta_array_fine - theta))
                 time_slice = np.argmin(np.abs(hjr_fno.time_array_fine - time))
                 reachable_set_slice = reachable_set[..., theta_slice, time_slice]
@@ -202,28 +207,41 @@ class Plotting:
                     linewidths=2
                 )
                 
-                #Find R_funnel
-                dx = (hjr_fno.grid_max[0] - hjr_fno.grid_min[0]) / (hjr_fno.N_fine[0] - 1)
-                mask = reachable_set_slice <= hjr_fno.safe_margin   # True = feasible
-                dist_field = distance_transform_edt(mask) * dx
-                row = hjr_fno.xs_to_rows(np.array([0]), N=hjr_fno.N_fine).astype(int)
-                col = hjr_fno.ys_to_cols(np.array([0]), N=hjr_fno.N_fine).astype(int)
-                R_star = dist_field[row, col]
-                # print("R_star",R_star)
+                '''feasible set'''
+                # CS = ax.contour(
+                #     hjr_fno.X_fine + hjr_fno.safe_regions[i][0],
+                #     hjr_fno.Y_fine + hjr_fno.safe_regions[i][1],
+                #     hjr_fno.feasible_region[i],
+                #     levels=[hjr_fno.safe_margin],
+                #     colors='green',
+                #     linewidths=2
+                # )
                 
-                R = float(R_star)   # convert from array to scalar
-                x_c, y_c = hjr_fno.safe_regions[i][:2]
+                '''R-Funnel'''
+                # #Find R_funnel
+                # dx = (hjr_fno.grid_max[0] - hjr_fno.grid_min[0]) / (hjr_fno.N_fine[0] - 1)
+                # mask = reachable_set_slice <= hjr_fno.safe_margin   # True = feasible
+                # dist_field = distance_transform_edt(mask) * dx
+                # row = hjr_fno.xs_to_rows(np.array([0]), N=hjr_fno.N_fine).astype(int)
+                # col = hjr_fno.ys_to_cols(np.array([0]), N=hjr_fno.N_fine).astype(int)
+                # R_star = dist_field[row, col]
+                # # print("R_star",R_star)
+                
+                # R = float(R_star)   # convert from array to scalar
+                # x_c, y_c = hjr_fno.safe_regions[i][:2]
 
-                circle = patches.Circle(
-                    (x_c, y_c),
-                    R,
-                    facecolor='orange',
-                    edgecolor='orange',
-                    alpha=0.4,
-                    linewidth=2
-                )
-                ax.add_patch(circle)
+                # circle = patches.Circle(
+                #     (x_c, y_c),
+                #     R,
+                #     facecolor='orange',
+                #     edgecolor='orange',
+                #     alpha=0.4,
+                #     linewidth=2
+                # )
+                # ax.add_patch(circle)
                 
+                
+                '''Contouf of ValueFunction'''
                 # Z_masked = np.ma.masked_where(reachable_set_slice > 0, reachable_set_slice)
                 
                 # X = hjr_fno.X_fine + hjr_fno.safe_regions[i][0]
@@ -245,10 +263,13 @@ class Plotting:
             #When obstacle appears, use predicted reachable set via Neural Operator
             else:
                 
+                '''reachable set'''
                 theta_slice = np.argmin(np.abs(hjr_fno.theta_array - theta))
                 time_slice = np.argmin(np.abs(hjr_fno.time_array - time))
                 
-                reachable_set_slice = reachable_set[...,theta_slice, time_slice].detach().cpu().numpy()
+                if torch.is_tensor(reachable_set):
+                    reachable_set = reachable_set.detach().cpu().numpy()
+                reachable_set_slice = reachable_set[...,theta_slice, time_slice]        
             
                 CS = ax.contour(
                     hjr_fno.X + hjr_fno.safe_regions[i][0],
@@ -259,30 +280,42 @@ class Plotting:
                     linewidths=2
                 )
                 
+                '''feasible set'''
+                # CS = ax.contour(
+                #     hjr_fno.X + hjr_fno.safe_regions[i][0],
+                #     hjr_fno.Y + hjr_fno.safe_regions[i][1],
+                #     hjr_fno.feasible_region[i],
+                #     levels=[hjr_fno.safe_margin],
+                #     colors='green',
+                #     linewidths=2
+                # )
                 
                 
+                
+                '''R-Funnel'''
                 #Find R_funnel
-                dx = (hjr_fno.grid_max[0] - hjr_fno.grid_min[0]) / (hjr_fno.N[0] - 1)
-                mask = reachable_set_slice <= hjr_fno.safe_margin   # True = feasible
-                dist_field = distance_transform_edt(mask) * dx
-                row = hjr_fno.xs_to_rows(np.array([0]), N=hjr_fno.N).astype(int)
-                col = hjr_fno.ys_to_cols(np.array([0]), N=hjr_fno.N).astype(int)
-                R_star = dist_field[row, col]
-                # print("R_star",R_star)
+                # dx = (hjr_fno.grid_max[0] - hjr_fno.grid_min[0]) / (hjr_fno.N[0] - 1)
+                # mask = reachable_set_slice <= hjr_fno.safe_margin   # True = feasible
+                # dist_field = distance_transform_edt(mask) * dx
+                # row = hjr_fno.xs_to_rows(np.array([0]), N=hjr_fno.N).astype(int)
+                # col = hjr_fno.ys_to_cols(np.array([0]), N=hjr_fno.N).astype(int)
+                # R_star = dist_field[row, col]
+                # # print("R_star",R_star)
                 
-                R = float(R_star)   # convert from array to scalar
-                x_c, y_c = hjr_fno.safe_regions[i][:2]
+                # R = float(R_star)   # convert from array to scalar
+                # x_c, y_c = hjr_fno.safe_regions[i][:2]
 
-                circle = patches.Circle(
-                    (x_c, y_c),
-                    R,
-                    facecolor='orange',
-                    edgecolor='orange',
-                    alpha=0.4,
-                    linewidth=2
-                )
-                ax.add_patch(circle)
+                # circle = patches.Circle(
+                #     (x_c, y_c),
+                #     R,
+                #     facecolor='orange',
+                #     edgecolor='orange',
+                #     alpha=0.4,
+                #     linewidth=2
+                # )
+                # ax.add_patch(circle)
                 
+                '''Contouf of ValueFunction'''
                 # Z_masked = np.ma.masked_where(reachable_set_slice > 0, reachable_set_slice)
                 # X = hjr_fno.X + hjr_fno.safe_regions[i][0]
                 # Y = hjr_fno.Y + hjr_fno.safe_regions[i][1]

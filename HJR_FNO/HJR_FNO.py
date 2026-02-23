@@ -25,6 +25,8 @@ from matplotlib.animation import FuncAnimation, PillowWriter
 from matplotlib.figure import Figure
 from matplotlib.axes import Axes
 
+from scipy.ndimage import gaussian_filter
+
 # =========================
 # PyTorch imports
 # =========================
@@ -45,8 +47,8 @@ from .neural_utils import *
 # =========================
 # Reproducibility
 # =========================
-torch.manual_seed(0)
-np.random.seed(0)
+# torch.manual_seed(0)
+# np.random.seed(0)
 
 
 #---------------------
@@ -255,6 +257,35 @@ class Plane:
         dx = self.dynamics(0, self.x, u, d)
         self.x = self.x + dx * dt
         
+        
+    def optCtrl_grid(self, deriv, theta_grid, uMode='min'):
+        """
+        Vectorized optimal control over the entire grid.
+
+        Parameters
+        ----------
+        deriv      : list of 3 arrays [Vx, Vy, Vtheta], each (Nx, Ny, Ntheta)
+        theta_grid : array (1, 1, Ntheta) — grid.xs[2]
+        uMode      : 'min' or 'max'
+
+        Returns
+        -------
+        v_opt     : np.ndarray (Nx, Ny, Ntheta)
+        omega_opt : np.ndarray (Nx, Ny, Ntheta)
+        """
+        Vx, Vy, Vtheta = deriv[0], deriv[1], deriv[2]
+
+        det1 = Vx * np.cos(theta_grid) + Vy * np.sin(theta_grid)
+
+        if uMode == 'max':
+            v_opt     = np.where(det1  >= 0, self.vrange[1],  self.vrange[0])
+            omega_opt = np.where(Vtheta >= 0, self.wMax,      -self.wMax)
+        else:  # 'min'
+            v_opt     = np.where(det1  >= 0, self.vrange[0],  self.vrange[1])
+            omega_opt = np.where(Vtheta >= 0, -self.wMax,      self.wMax)
+
+        return v_opt, omega_opt
+        
 #---------------------------------------
 # Derivative Function from HelperOC Toolbox
 # https://github.com/HJReachability/helperOC
@@ -426,7 +457,9 @@ class HJR_FNO:
           
         self.device = device
         
-        save_path = Path(__file__).resolve().parent / "model/hjrno_dubins_best_so_far"
+        # save_path = Path(__file__).resolve().parent / "model/hjrno_dubins_best_so_far"
+        # save_path = "/home/kmuenpra/git/HJR-FNO-ContingencyPlanning/test/model/hjrno_dubins_2_1"
+        save_path = '/home/kmuenpra/git/HJR-FNO-ContingencyPlanning/test/model/hjrno_dubins_2_4'
 
         if not os.path.exists(save_path):
             raise FileNotFoundError(f"HJR-FNO model not found at {save_path}")
@@ -444,7 +477,7 @@ class HJR_FNO:
         #Define 3D Plane dynamics
         x_init = np.array([0, 0, 0])
         self.wMax = 1
-        self.vrange = [0.03, 1]
+        self.vrange = [0, 1.5]
         self.dMax = [0, 0, 0]
         self.plane = Plane(x_init, self.wMax, self.vrange, self.dMax)
         
@@ -452,7 +485,7 @@ class HJR_FNO:
         # Define grid 
         self.grid_min = np.array([-10.0, -10.0, 0.0])
         self.grid_max = np.array([10.0, 10.0, 2 * math.pi])
-        self.N = np.array([100, 100, 15, 17]) #Dimension for [x,y,theta] ;  original (50,50,25)
+        self.N = np.array([100, 100, 17, 17]) #Dimension for [x,y,theta] ;  original (50,50,25)
         self.pd = [2]  # theta is periodic
 
         self.g = Grid(
@@ -474,17 +507,22 @@ class HJR_FNO:
         mat_data = loadmat('test/HJB_training_mat/50_50_25_SDF_no_obs.mat')  # Update this path
         # mat_data = loadmat('test/HJB_training_mat/Plane_NoObs_10steps.mat')  # Update this path
         data_safe = mat_data['BRT_all'][0][0] #Exact reachable set for no obstacle case
-        self.N_fine = np.array([50,50,25,33]) #21]
+        data_safe = data_safe[...,::2]
+        self.true_reach_obsFree = data_safe
+        self.N_fine = np.array([50,50,25,17]) #33]
         self.g_fine = Grid(
             self.grid_min,
             self.grid_max,
             self.N_fine[:3],
-            self.pd
+            self.pd 
         )
         # NOTE Pre-computed set "data_safe is discretized to (50,50,25,33) == (x,y,theta,time)
         
         self.obs_SDF = [ np.empty(self.N[:3]) for i in range(self.num_safe_regions)]
         self.obs_list = [ [] for i in range(self.num_safe_regions)] #store all obstacles seen so far for each safe region
+        
+        #safe set is the same for all instance of training data
+        self.safeSet_SDF = -self.shapeCylinder(ignoreDims=[2], center=[0,0,0], radius=2)
         
         # Precompute spatial meshgrid (XY only)
         self.X_fine, self.Y_fine = np.meshgrid(
@@ -536,8 +574,12 @@ class HJR_FNO:
             self.feasible_region.append(np.max(reach_i[...,Tf_slice], axis=2))
             
             
+            
+            
+
+        self.safe_margin = -0.615 #ensure safe set is within V(x,y) <= safe_margin < 0
         
-        self.safe_margin = -0.5 #ensure safe set is within V(x,y) <= safe_margin < 0
+        print(self.build_overlap_index_list(level=self.safe_margin, area_tol=0.0))
         
         
     # Single-query reachable set prediction
@@ -660,7 +702,7 @@ class HJR_FNO:
         return pred_reshaped
     
     
-    def shapeCylinder(self, ignoreDims=None, center=None, radius=1.0):
+    def shapeCylinder(self, ignoreDims=None, center=None, radius=1.0, g=None):
         """
         Create a cylindrical signed distance function on the grid.
 
@@ -673,8 +715,8 @@ class HJR_FNO:
         - sdf: signed distance field with shape g.N
         """
 
-
-        g = self.g
+        if g is None:
+            g = self.g
         dim = g.dim
 
         # Default arguments
@@ -747,13 +789,18 @@ class HJR_FNO:
                 #Predict HJRNO reachable set (again)
                 # (Nx, Ny, Ntheta, Nt)
                 self.HJR_sets[i] = self.predict(sdf_input=self.obs_SDF[i], theta_hyparam=self.theta_array, time_hyparam=self.time_array)
+                # self.HJR_sets[i] =  self.check_hj_descent_grid( self.g,
+                #                                                 self.HJR_sets[i],        # (Nx, Ny, Ntheta, Nt)
+                #                                                 self.obs_SDF[i],      # (Nx, Ny, Ntheta)  or None
+                #                                                 dt=(self.time_array[1]-self.time_array[0]))
             
         #Update feasible region (find miminal set with respect to all theta slices) for RRT planning
         for i, reach_i in enumerate(self.HJR_sets):
             
             #Find time slice of the reachable set
             if self.obs_list[i]:
-                reach_i = reach_i.cpu().numpy()
+                if torch.is_tensor(reach_i):
+                    reach_i = reach_i.cpu().numpy()
                 Tf_slice = np.argmin(np.abs(self.time_array - self.Tf_reach))
                                      
             #Special case: No obstacle yet, we use exact (pre-computed) reachable set with finer discretization
@@ -761,6 +808,84 @@ class HJR_FNO:
                 Tf_slice = np.argmin(np.abs(self.time_array_fine - self.Tf_reach))
                 
             self.feasible_region[i] = np.max(reach_i[..., Tf_slice], axis=2)
+            
+    def check_hj_descent_grid(self,
+                           grid,
+                           V_raw,        # (Nx, Ny, Ntheta, Nt)
+                           obs_sdf,      # (Nx, Ny, Ntheta)  or None
+                           dt):
+        """
+        For every time slice, compute the HJ residual and mask the reachable set.
+
+        Parameters
+        ----------
+        grid    : hj_reachability Grid object
+        V_raw   : np.ndarray (Nx, Ny, Ntheta, Nt)
+        obs_sdf : np.ndarray (Nx, Ny, Ntheta) — positive inside obstacle, or None
+        dt      : float — time step (self.time_array[1] - self.time_array[0])
+
+        Returns
+        -------
+        V_masked  : np.ndarray (Nx, Ny, Ntheta, Nt)
+                    V_masked[..., t] <= 0  where HJ residual <= 0, else np.inf
+        hj_values : np.ndarray (Nx, Ny, Ntheta, Nt)
+        V         : np.ndarray (Nx, Ny, Ntheta, Nt)  — after max{V, g} clamp
+        """
+        if torch.is_tensor(V_raw):
+            V_raw = V_raw.cpu().numpy()
+
+        Nt = V_raw.shape[-1]
+
+        # ------------------------------------------------------------------ #
+        # 1.  V = max{V, g}  for every time slice at once
+        # ------------------------------------------------------------------ #
+        if obs_sdf is not None:
+            if torch.is_tensor(obs_sdf):
+                obs_sdf = obs_sdf.cpu().numpy()
+            g = -obs_sdf                                   # (Nx, Ny, Ntheta)
+            V = np.maximum(V_raw, g[..., np.newaxis])      # broadcast over Nt
+        else:
+            g = None
+            V = V_raw.copy()
+
+        # ------------------------------------------------------------------ #
+        # 2.  Time derivative  dV/dt  — central diff interior, one-sided edges
+        #     shape: (Nx, Ny, Ntheta, Nt)
+        # ------------------------------------------------------------------ #
+        V_t = np.empty_like(V)
+        V_t[..., 1:-1] = (V[..., 2:] - V[..., :-2]) / (2 * dt)  # central
+        V_t[...,    0] = (V[...,  1] - V[...,   0]) / dt         # forward
+        V_t[...,   -1] = (V[..., -1] - V[...,  -2]) / dt         # backward
+
+        # ------------------------------------------------------------------ #
+        # 3.  Spatial gradients + Hamiltonian for every time slice
+        # ------------------------------------------------------------------ #
+        theta_grid = grid.xs[2]                            # (1, 1, Ntheta) broadcast-ready
+        ham = np.empty_like(V)
+
+        for t_idx in range(Nt):
+            V_slice = V[..., t_idx]
+
+            Deriv = computeGradients(grid, V_slice)
+            Vx, Vy, Vtheta = Deriv[0], Deriv[1], Deriv[2]
+
+            v_opt, omega_opt = self.plane.optCtrl_grid(
+                [Vx, Vy, Vtheta], theta_grid, uMode='min'
+            )
+
+            ham[..., t_idx] = (
+                Vx       * v_opt * np.cos(theta_grid)
+                + Vy     * v_opt * np.sin(theta_grid)
+                + Vtheta * omega_opt
+            )
+
+        # ------------------------------------------------------------------ #
+        # 4.  HJ residual  and  mask
+        # ------------------------------------------------------------------ #
+        hj_values = V_t + ham                              # (Nx, Ny, Ntheta, Nt)
+        V_masked  = np.where(hj_values <= 0, V, np.inf)   # keep only valid points
+
+        return V_masked
                     
     def ys_to_cols(self, ys: np.ndarray, N=None) -> np.ndarray:
         
@@ -983,7 +1108,7 @@ class HJR_FNO:
                 vals_e[mask] = interp(pts)
                 
             # Check feasibility: inside reachable set
-            if np.any( vals_e > self.safe_margin):
+            if np.any( vals_e > self.safe_margin - 0.06):
                 return False
 
 
@@ -1019,7 +1144,7 @@ class HJR_FNO:
 
                 interp = RegularGridInterpolator(
                     (self.g.vs[0], self.g.vs[1]),
-                    np.maximum( self.feasible_region[region], -self.obs_SDF[region][...,0]),
+                    self.feasible_region[region],
                     bounds_error=False,
                     fill_value=None
                 )
@@ -1027,7 +1152,7 @@ class HJR_FNO:
                 vals_n[mask] = interp(pts)
                 
             # Check feasibility: inside reachable set
-            if np.any( vals_n > self.safe_margin):
+            if np.any( vals_n > self.safe_margin - 0.06):
                 return False
 
 
@@ -1247,21 +1372,20 @@ class HJR_FNO:
     
     def check_hj_descent(self, 
                      grid,
+                     data_safe,
                      closest_idx,
                      t_idx,
                      x,
                      dt):
 
-        # 1. Load spatial slice
-        data_safe = self.HJR_sets[closest_idx]
-        if torch.is_tensor(data_safe):
-            data_safe = data_safe.cpu().numpy()
 
         data_union = data_safe[:, :, :, t_idx]
         
-        # print("data_safe shape:", data_safe.shape)
-        # print("data_union shape:", data_union.shape)
-        # print("grid dims:", len(grid.vs))
+        # 1 Take V = max{V,g} s.t. V >= g always holds
+        if self.obs_list[closest_idx]:
+            data_union = np.maximum(data_union, -self.obs_SDF[closest_idx])
+        
+
 
 
         # 2. Evaluate value function at x
@@ -1277,7 +1401,7 @@ class HJR_FNO:
         theta = x[2]
 
         # 4. Hamiltonian term  ∇V · f
-        dot_term = (
+        ham_term = (
             Vx * v * np.cos(theta)
             + Vy * v * np.sin(theta)
             + Vtheta * omega
@@ -1292,14 +1416,14 @@ class HJR_FNO:
             dt
         )
 
-        hj_value = dot_term + V_t   # ∂t V + H
+        hj_value = V_t + ham_term    # ∂t V + H
 
         # 6. Obstacle term g(x) - V(x,t)
         if self.obs_list[closest_idx]:
-            g_val = self.eval_value_at_state(grid, self.obs_SDF[closest_idx], x)
-            obstacle_term = -g_val - V_val
+            g_val = self.eval_value_at_state(grid, -self.obs_SDF[closest_idx], x)
+            # obstacle_term = -g_val - V_val
         else:
-            obstacle_term = 0
+            g_val = None
         
 
         # 7. Full HJI-VI residual
@@ -1309,17 +1433,35 @@ class HJR_FNO:
 
         # is_safe = residual <= 0.0
 
-        return hj_value, obstacle_term
+        return hj_value, g_val, V_val
 
 
 
     '''
     For Contingency Planning toward safe region
     '''
+
+    def smooth_value_function_xy(self, data_union, sigma_xy=1.0):
+        """
+        Smooth value function spatially in (x,y) only.
+        
+        data_union: (Nx, Ny, Ntheta)
+        sigma_xy: standard deviation of Gaussian in grid units
+        """
+        data_smooth = np.empty_like(data_union)
+
+        for k in range(data_union.shape[2]):  # loop over theta
+            data_smooth[:, :, k] = gaussian_filter(
+                data_union[:, :, k],
+                sigma=sigma_xy,
+                mode='nearest'   # or 'reflect'
+            )
+
+        return data_smooth
     
     
 
-    def contingency_policy_old(self, robot_state:List, plotting, fig:Figure, ax:Axes):
+    def contingency_policy(self, robot_state:List, plotting, fig:Figure, ax:Axes, showplot=True):
     
         
         closest_idx_list = self.find_feasible_closest_region(robot_pose=np.array(robot_state[:2]), returnList=True)
@@ -1355,6 +1497,7 @@ class HJR_FNO:
         for i in range(len(reordered_top3)):
             
             closest_idx = reordered_top3[i]
+            print(f"Choosing set {closest_idx}")
             
             #Update state in dynamics w.r.t. local frame
             
@@ -1385,7 +1528,7 @@ class HJR_FNO:
             
             theta_slice = np.argmin(np.abs(grid.vs[2] - self.plane.x[2]))
             tauLength = len(time_array)
-            subSamples = 4
+            subSamples = 8
             dtSmall = (time_array[1] - time_array[0]) / subSamples
             
             # Binary search for the smallest time index where state is in BRS
@@ -1419,7 +1562,7 @@ class HJR_FNO:
             # Check if trajectory has reached the target (smallest set)
             if tEarliest == 0:
                 print("Trajectory has entered the target!")
-                return [], np.array([robot_state])  # Already at target, no contingency needed
+                return [], np.array([robot_state]), 0, True, None, None, None    # Already at target, no contingency needed
             
             # Check if robot is in any BRS (if not, we have a problem)
             if tEarliest >= tauLength - 1:
@@ -1432,7 +1575,7 @@ class HJR_FNO:
     
     
         # State-based time tracking
-        t = time_array[tEarliest] #time_array[tEarliest+1]
+        t = time_array[-1] #time_array[tEarliest]
         t_max = self.tf
         trajectory = np.array([x_r, y_r, theta])
 
@@ -1448,7 +1591,21 @@ class HJR_FNO:
         # #Colorbar 
         # cax = fig.add_axes([0.88, 0.15, 0.03, 0.7])  # [left, bottom, width, height]
         # cbar = None
+        
+        safe_margin = self.safe_margin
+        smallTol = 1E-1
+        
+        self.grad_smooth = None   # store previous smoothed gradient
+        self.alpha = 0.3          # smoothing factor (0.2–0.5 works well)
+        self.grad_eps = 1e-4      # gradient magnitude threshold
             
+        #Fallback policy boolean
+        fallback_plan = False
+        success = True
+        V_val_failed = None
+        g_val_failed = None
+        ham_failed = None
+        
         while t > 0:
             
             
@@ -1478,49 +1635,175 @@ class HJR_FNO:
             #     t = t_next
             #     continue
             
+
+            # 1. Load reachable set
+            data_safe = self.HJR_sets[closest_idx]
+            if torch.is_tensor(data_safe):
+                data_safe = data_safe.cpu().numpy()
+                
+            # Use the reachable set at this backward time
+            data_union = data_safe[:, :, :, brt_time_slice]
             
-            """
-            Check Vdot <= 0
-            """
-            hj_value, obstacle_term = self.check_hj_descent(
+            if self.obs_list[closest_idx]:
+                data_union = np.maximum(data_union, -self.obs_SDF[closest_idx])
+
+            # data_union = np.minimum(data_union, self.shapeCylinder(ignoreDims=[2], center=[0,0,0], radius=2))
+           
+            #Check Vdot <= 0
+          
+            ham_term, g_val, V_val = self.check_hj_descent(
                 grid,
+                data_safe,
                 closest_idx,
                 brt_time_slice,
                 self.plane.x,
                 t - t_next
             )
+            
+            if g_val is not None:
+                V_val = max(V_val, g_val)
+                obstacle_term = g_val - V_val   
+            else:
+                obstacle_term = 0
 
-            print(f"t = {t}, DtV+H: {hj_value}, g-V: {obstacle_term}")
+            print(
+                f"t = {t:.3f}, "
+                f"DtV+H: {ham_term:.3f} ({ham_term <= 0}), "
+                f"g-V: {obstacle_term:.3f} ({obstacle_term <= 0}), "
+                f"V(x): {V_val:.3f} ({V_val <= 0})"
+            ) 
+            
+            
+
+            # Check Ldot <= 0
+         
+            
+            # # 2. Evaluate value function at x
+            # L_val = self.eval_value_at_state(grid, self.safeSet_SDF, self.plane.x)
+
+            # # 3. Spatial gradient
+            # Deriv = computeGradients(grid, self.safeSet_SDF)
+            # grad_L = eval_u(grid, Deriv, self.plane.x)   # [Vx, Vy, Vtheta]
+            # u = self.plane.optCtrl(0, self.plane.x, grad_L, 'min')
+
+            # print(
+            #     f" - "
+            #     f"L(x): {L_val}, "
+            #     f"grad L(x): {grad_L}, "
+            #     f"opt Control: {u}"
+            # )      
 
             
+            pde_tol = 15e-3
+            fallback_plan = False
+            if ham_term > 0 or V_val > safe_margin:
+                
+                fallback_plan = True
+                    
+                # # Re-exapnd the set
+                # print("Recompute minimum time")
+                # t = time_array[-1]
+                # time_idx = np.argmin(np.abs(time_array - t))
+                # t_next = time_array[time_idx - 1] # step back in time
+                # brt_time_slice = time_idx
+                
+                
+                print("Using gradient of true set")
+                # Use True (obstacle-free) reachable set value, intersected with obstacles
+                time_array = self.time_array_fine
+                grid = self.g_fine
+                
+                time_idx = np.argmin(np.abs(time_array - t))
+                t_next = time_array[time_idx - 1]
+                brt_time_slice = time_idx
+                
+                # Use the reachable set at this backward time
+                data_union_true = self.true_reach_obsFree[:, :, :, brt_time_slice]
+                
+                #Taking maximum with obstacles
+                if self.obs_list[closest_idx]:
+                    obs_SDF = None
+                    
+                    for obs in self.obs_list[closest_idx]:
+                        x,y,r = obs
+                    
+                        center = np.array([x - self.safe_regions[closest_idx][0], y - self.safe_regions[closest_idx][1], 0])
+                    
+                        if obs_SDF is None:
+                            obs_SDF = self.shapeCylinder(ignoreDims=[2], center=center, radius=r, g=grid)
+                        else:
+                            obs_SDF = np.minimum(obs_SDF,   self.shapeCylinder(ignoreDims=[2], center=center, radius=r, g=grid)   )
+                            
+                    
+                    data_union_true = np.maximum(data_union_true, -obs_SDF)
+                    
+                data_union = data_union_true
             
             
             """
             Apply HJB optimal control to return to safe region, given then the minimal-time reachable set is found
             """
             
-            data_safe = self.HJR_sets[closest_idx]  
-            if torch.is_tensor(data_safe):
-                data_safe = data_safe.cpu().numpy()
+            # data_safe = self.HJR_sets[closest_idx]  
+            # if torch.is_tensor(data_safe):
+            #     data_safe = data_safe.cpu().numpy()
             
-            # Use the reachable set at this backward time
-            data_union = data_safe[:, :, :, brt_time_slice]
+            # # Use the reachable set at this backward time
+            # data_union = data_safe[:, :, :, brt_time_slice]
             
-            if self.obs_list[closest_idx]:
-                data_union = np.maximum(data_union, -self.obs_SDF[closest_idx])
-                # data_union = np.minimum(data_union, self.shapeCylinder(ignoreDims=[2], center=[0,0,0], radius=2))
+            # if self.obs_list[closest_idx]:
+            #     data_union = np.maximum(data_union, -self.obs_SDF[closest_idx])
+            #     # data_union = np.minimum(data_union, self.shapeCylinder(ignoreDims=[2], center=[0,0,0], radius=2))
             
             # Compute gradients
+            # data_union = self.smooth_value_function_xy(data_union, sigma_xy=1.0)
             Deriv = computeGradients(grid, data_union) 
             for j in range(subSamples):
-                deriv = eval_u(grid, Deriv, self.plane.x)
                 
-                # print("derivative", deriv)
+                '''straightforward optCtrl'''
+                deriv = eval_u(grid, Deriv, self.plane.x)
                 
                 # Compute optimal control
                 u = self.plane.optCtrl(time_array[time_idx], self.plane.x, deriv, 'min')
-                # print("control", u)
+                # Compute worse-case disturbance
                 d = self.plane.optDstb(time_array[time_idx], self.plane.x, deriv, 'max')
+                
+                
+                '''Apply gradient smoothing'''
+                # # Raw gradient
+                # deriv_raw = eval_u(grid, Deriv, self.plane.x)
+
+                # # Initialize smoothed gradient
+                # if self.grad_smooth is None:
+                #     self.grad_smooth = deriv_raw.copy()
+
+                # # -------- Exponential Smoothing --------
+                # deriv_smooth = (
+                #     self.alpha * deriv_raw
+                #     + (1.0 - self.alpha) * self.grad_smooth
+                # )
+
+                # # -------- Normalize Direction --------
+                # norm = np.linalg.norm(deriv_smooth)
+                # if norm > self.grad_eps:
+                #     deriv_used = deriv_smooth / norm
+                # else:
+                #     # fallback if gradient too small
+                #     deriv_used = deriv_smooth
+
+                # # Store for next iteration
+                # self.grad_smooth = deriv_smooth.copy()
+
+                # # -------- Compute Optimal Control --------
+                # u = self.plane.optCtrl(
+                #     time_array[time_idx],
+                #     self.plane.x,
+                #     deriv_used,
+                #     'min'
+                # )
+                # # print("control", u)
+                # # print("value func", self.eval_value_at_state(grid, data_union, self.plane.x))
+                # d = self.plane.optDstb(time_array[time_idx], self.plane.x, deriv_raw, 'max')
                 
                 # Update state
                 self.plane.updateState(u, dtSmall, d)
@@ -1539,8 +1822,6 @@ class HJR_FNO:
             # # Store trajectory (Must be global position) NOTE plane.x is in the local frame of safe region
             trajectory = np.vstack((  trajectory , np.array([x_r, y_r, theta])))
 
-            t = t_next
-
             #Update reachable set
             if len(detected_obs) > 0:
                 print("Update reachable set with newly detected obstacles: ", detected_obs)
@@ -1549,7 +1830,9 @@ class HJR_FNO:
                 for obs in detected_obs:
                     detected_obs_list.append(obs) #update only new obstacles detected during contingency
                     obs_circle.append(obs) #update global obs_circle for ALL obstacles seen so far
-                    
+                   
+                   
+            if fallback_plan or len(detected_obs) > 0: 
                 # Determine which time array to use, based on different discretization
                 if self.obs_list[closest_idx]:
                     time_array = self.time_array #HJR-FNO reachable set with user-defined discretization
@@ -1562,16 +1845,10 @@ class HJR_FNO:
                     
             #Update obstacles for plotting and collision checking   
             plotting.update_obs(obs_circle, self.utils.obs_boundary, [], self.utils.unknown_obs_circle) # for plotting obstacles
-            self.utils.update_obs(obs_circle, self.utils.obs_boundary, [], self.utils.unknown_obs_circle) # for collision checking
+            self.utils.update_obs(obs_circle, self.utils.obs_boundary, [], self.utils.unknown_obs_circle) # for collision checking            
                 
                 
-            # # Plot contingency plan
-            # if cbar is not None:
-            #     cbar.ax.cla()     # clear axis first
-            #     cbar.remove()
-            #     cbar = None
-            #     cax = fig.add_axes([0.88, 0.15, 0.03, 0.7])
-                
+            # Plot contingency plan
             ax.clear()
             
             fig.suptitle(f"HJR-FNO Contincgency\n Safe Region: {self.safe_regions[closest_idx][:2]} | Time to Target: {self.tf - t:.2f}s")
@@ -1606,79 +1883,127 @@ class HJR_FNO:
             ax.plot(trajectory[:,0], trajectory[:,1], 
                    'r-', linewidth=2.5, label='Trajectory', zorder=5)
 
-            # print(f"Point: {(trajectory[-1,0], trajectory[-1,1])}, Feasible? {self.is_feasible((trajectory[-1,0], trajectory[-1,1]))}")
             
             #Load reachable set again, in case the discretization changes
             data_safe = self.HJR_sets[closest_idx]  
             if torch.is_tensor(data_safe):
                 data_safe = data_safe.cpu().numpy()
+                
             brt_time_slice = np.argmin(np.abs(time_array - t))
             data_union = data_safe[:, :, :, brt_time_slice]
             
-            # plot reachable set at current heading
-            Z = data_union[..., theta_slice]
-
-            # mask out values > 0
-            Z_masked = np.ma.masked_where(Z > 0, Z)
+            if self.obs_list[closest_idx]:
+                data_union = np.maximum(data_union, -self.obs_SDF[closest_idx])
             
-            # rows = self.xs_to_rows(np.array([self.plane.x[0]]), N=grid.N)
-            # cols = self.ys_to_cols(np.array([self.plane.x[1]]), N=grid.N)
-            # row = int(rows[0])
-            # col = int(cols[0])
             
-            # Z_masked[row, col] = 100  # ensure current position is visible
+            
+            if showplot:
+                # plot reachable set at current heading
+                Z = data_union[..., theta_slice]
 
-            contourf = ax.contourf(
-                grid.xs[0][..., 0] + self.safe_regions[closest_idx][0],
-                grid.xs[1][..., 0] + self.safe_regions[closest_idx][1],
-                Z_masked,
-                levels=50,
-                cmap="Blues_r",
-                vmin=np.min(Z),          # keep original scale
-                vmax=np.max(Z),
-                alpha=0.7
+                # mask out values > 0
+                Z_masked = np.ma.masked_where(Z > 0, Z)
+                
+                # rows = self.xs_to_rows(np.array([self.plane.x[0]]), N=grid.N)
+                # cols = self.ys_to_cols(np.array([self.plane.x[1]]), N=grid.N)
+                # row = int(rows[0])
+                # col = int(cols[0])
+                
+                # Z_masked[row, col] = 100  # ensure current position is visible
+
+                contourf = ax.contourf(
+                    grid.xs[0][..., 0] + self.safe_regions[closest_idx][0],
+                    grid.xs[1][..., 0] + self.safe_regions[closest_idx][1],
+                    Z_masked,
+                    levels=50,
+                    cmap="Blues_r",
+                    vmin=np.min(Z),          # keep original scale
+                    vmax=np.max(Z),
+                    alpha=0.7
+                )
+
+                
+                
+                CS = ax.contour(
+                        grid.xs[0][...,0] + self.safe_regions[closest_idx][0],
+                        grid.xs[1][...,0] + self.safe_regions[closest_idx][1],
+                        Z ,
+                        levels=[self.safe_margin],
+                        colors='magenta',
+                        linewidths=2
+                )   
+                
+                CS2 = ax.contour(
+                        grid.xs[0][...,0] + self.safe_regions[closest_idx][0],
+                        grid.xs[1][...,0] + self.safe_regions[closest_idx][1],
+                        Z ,
+                        levels=[0],
+                        colors='green',
+                        linewidths=2
+                )   
+                
+                
+                
+                ax.grid(True)
+                
+                plt.pause(0.3) #original 0.3s     
+            
+            
+            # if reach the safe set early
+            if (self.plane.x[0]**2 + self.plane.x[1]**2) <= (2)**2:
+                
+                if not success and g_val_failed <= 0:
+                    success = True
+                    V_val_failed = None
+                    g_val_failed = None
+                    ham_failed    = None
+                
+                return detected_obs_list, trajectory, (t_max-t), success, V_val_failed, g_val_failed, ham_failed 
+            
+            
+            #---------- Fallback Plan checking --------------
+            
+            #Compute the HJI-VI terms
+            ham_term, g_val, V_val = self.check_hj_descent(
+                grid,
+                data_safe,
+                closest_idx,
+                brt_time_slice,
+                self.plane.x,
+                t - t_next
             )
+            
+            if g_val is not None:
+                V_val = max(V_val, g_val)
+                obstacle_term = g_val - V_val   
+            else:
+                obstacle_term = 0
+            
+            #Check HJ condition for g(x)>0 or V>0
+            if obstacle_term > 0 or V_val > 0:
+                success  = False   
+                g_val_failed = g_val 
+                V_val_failed = V_val
+                
+            if ham_term > 0 and not success:
+                ham_failed = ham_term
+        
 
+            t = t_next 
             
-            #colorbar
-            # create fresh colorbar
-            # cbar = fig.colorbar(contourf, cax=cax)
-            # cbar.set_label("Value Function", fontsize=8)
-            
-            
-            CS = ax.contour(
-                    grid.xs[0][...,0] + self.safe_regions[closest_idx][0],
-                    grid.xs[1][...,0] + self.safe_regions[closest_idx][1],
-                    Z ,
-                    levels=[self.safe_margin],
-                    colors='magenta',
-                    linewidths=2
-            )   
-            
-            CS2 = ax.contour(
-                    grid.xs[0][...,0] + self.safe_regions[closest_idx][0],
-                    grid.xs[1][...,0] + self.safe_regions[closest_idx][1],
-                    Z ,
-                    levels=[0],
-                    colors='green',
-                    linewidths=2
-            )   
-            
-            
-            
-            ax.grid(True)
-            
-            plt.pause(0.3) #original 0.3s            
-        # if cbar is not None:
-        #     cbar.ax.cla()     # clear axis first
-        #     cbar.remove()
-        #     cbar = None
-
-
-        return detected_obs_list, trajectory
+        #In the end if it does not reach safe set, then consider fails
+        if (self.plane.x[0]**2 + self.plane.x[1]**2) > (2)**2:    
+            success = False
+         
+                
+        self.grad_smooth = None 
+        V_val_failed = V_val
+        g_val_failed = g_val
+        ham_failed = ham_term
+        return detected_obs_list, trajectory, t_max, success, V_val_failed, g_val_failed, ham_failed
     
     
-    def contingency_policy(self, robot_state:List, plotting, fig:Figure, ax:Axes):
+    def contingency_policy_newTest(self, robot_state:List, plotting, fig:Figure, ax:Axes):
     
         
         closest_idx_list = self.find_feasible_closest_region(robot_pose=np.array(robot_state[:2]), returnList=True)
@@ -1691,29 +2016,29 @@ class HJR_FNO:
         # Take first 3 closest indices
         top3 = closest_idx_list[:3]
 
-        heading_deviation = []
+        # heading_deviation = []
 
-        for idx in top3:
-            x_g, y_g = self.safe_regions[idx][:2]
+        # for idx in top3:
+        #     x_g, y_g = self.safe_regions[idx][:2]
 
-            dx = x_g - x_r
-            dy = y_g - y_r
+        #     dx = x_g - x_r
+        #     dy = y_g - y_r
 
-            theta_des = math.atan2(dy, dx)
-            delta_theta = ((theta_des - theta) + np.pi) % (2*np.pi) - np.pi
+        #     theta_des = math.atan2(dy, dx)
+        #     delta_theta = ((theta_des - theta) + np.pi) % (2*np.pi) - np.pi
 
-            heading_deviation.append((idx, abs(delta_theta)))
+        #     heading_deviation.append((idx, abs(delta_theta)))
 
-        # Sort by smallest angular deviation
-        heading_deviation.sort(key=lambda x: x[1])
+        # # Sort by smallest angular deviation
+        # heading_deviation.sort(key=lambda x: x[1])
 
-        # Extract reordered indices
-        reordered_top3 = [idx for idx, _ in heading_deviation]
+        # # Extract reordered indices
+        # reordered_top3 = [idx for idx, _ in heading_deviation]
         
  
-        for i in range(len(reordered_top3)):
+        for i in range(len(top3)):
             
-            closest_idx = reordered_top3[i]
+            closest_idx = top3[i]
             
             #Update state in dynamics w.r.t. local frame
             
@@ -1873,13 +2198,15 @@ class HJR_FNO:
             Deriv = computeGradients(grid, data_union) 
             for j in range(subSamples):
                 deriv = eval_u(grid, Deriv, self.plane.x)
-                
-                # print("derivative", deriv)
-                
+            
                 # Compute optimal control
                 u = self.plane.optCtrl(time_array[time_idx], self.plane.x, deriv, 'min')
-                # print("control", u)
+                
                 d = self.plane.optDstb(time_array[time_idx], self.plane.x, deriv, 'max')
+                
+                if j%3 == 0:
+                    print("derivative", deriv)
+                    print("control", u)
                 
                 # Update state
                 self.plane.updateState(u, dtSmall, d)
@@ -1931,6 +2258,9 @@ class HJR_FNO:
             #This is for plotting later
             brt_time_slice = np.argmin(np.abs(time_array - t))
             data_union = data_safe[:, :, :, brt_time_slice]
+            
+            if self.obs_list[closest_idx]:
+                data_union = np.maximum(data_union, -self.obs_SDF[closest_idx])
             
             
             '''Plotting'''
@@ -2066,3 +2396,206 @@ class HJR_FNO:
 
 
         return detected_obs_list, trajectory
+    
+    
+
+    def compute_area_2d(self, phi: np.ndarray,
+                        dx: float,
+                        dy: float,
+                        level: float = 0.0) -> float:
+        """
+        Compute area of 2D level set {phi <= level}
+        
+        Returns
+        -------
+        float : approximate area
+        """
+        mask = phi <= level
+        return np.count_nonzero(mask) * dx * dy
+    
+
+    def compute_overlap_2d(self, phi1: np.ndarray,
+                        x1: np.ndarray,
+                        y1: np.ndarray,
+                        phi2: np.ndarray,
+                        x2: np.ndarray,
+                        y2: np.ndarray,
+                        level1: float = 0.0,
+                        level2: float = 0.0) -> float:
+        """
+        Compute intersection area between
+        {phi1 <= level1} and {phi2 <= level2}
+        
+        Interpolates phi2 onto phi1 grid.
+        
+        Parameters
+        ----------
+        phi1, phi2 : 2D ndarray
+            Level-set arrays
+        x1, y1 : 1D arrays
+            Grid coordinates for phi1
+        x2, y2 : 1D arrays
+            Grid coordinates for phi2
+        level1, level2 : float
+            Thresholds
+        
+        Returns
+        -------
+        float : approximate overlap area
+        """
+        
+        dx = x1[1] - x1[0]
+        dy = y1[1] - y1[0]
+
+        # Build interpolator for phi2
+        interp_phi2 = RegularGridInterpolator(
+            (x2, y2),
+            phi2,
+            bounds_error=False,
+            fill_value=np.inf  # outside domain = not inside set
+        )
+
+        # Evaluate phi2 on grid1
+        X1, Y1 = np.meshgrid(x1, y1, indexing="ij")
+        pts = np.stack([X1.ravel(), Y1.ravel()], axis=-1)
+        phi2_on_grid1 = interp_phi2(pts).reshape(phi1.shape)
+
+        mask1 = phi1 <= level1
+        mask2 = phi2_on_grid1 <= level2
+
+        overlap_mask = mask1 & mask2
+
+        return np.count_nonzero(overlap_mask) * dx * dy
+    
+
+    def check_overlap_threshold_translate_phi2(
+        self,
+        phi1, x1, y1,
+        phi2, x2, y2,
+        dx1, dy1,
+        r,
+        A_min,
+        level1=0.0,
+        level2=0.0,
+        n_angle=32,
+        n_radius=5
+    ):
+        """
+        Check if there exists translation ||d|| <= r
+        such that overlap >= A_min.
+
+        Returns:
+            True/False,
+            shift (if found, else None)
+        """
+
+        mask1 = phi1 <= level1
+
+        interp_phi2 = RegularGridInterpolator(
+            (x2, y2),
+            phi2,
+            bounds_error=False,
+            fill_value=np.inf
+        )
+
+        X1, Y1 = np.meshgrid(x1, y1, indexing="ij")
+        pts_base = np.stack([X1.ravel(), Y1.ravel()], axis=-1)
+
+        radii = np.linspace(0, r, n_radius)
+        angles = np.linspace(0, 2*np.pi, n_angle, endpoint=False)
+
+        for rho in radii:
+            for theta in angles:
+
+                dx_shift = rho * np.cos(theta)
+                dy_shift = rho * np.sin(theta)
+
+                shifted_pts = pts_base - np.array([dx_shift, dy_shift])
+
+                phi2_shifted = interp_phi2(shifted_pts)
+                phi2_shifted = phi2_shifted.reshape(phi1.shape)
+
+                mask2 = phi2_shifted <= level2
+
+                overlap = np.count_nonzero(mask1 & mask2) * dx1 * dy1
+
+                if overlap >= A_min:
+                    return True, (dx_shift, dy_shift)
+
+        return False, None
+    
+    
+    def build_overlap_index_list(self,
+                             level=0.0,
+                             area_tol=0.0):
+
+
+        N = len(self.feasible_region)
+        overlap_list = [[] for _ in range(N)]
+
+        for i in range(N):
+
+            phi_i = self.feasible_region[i]
+            ci = self.safe_regions[i]
+            cx_i, cy_i, ri = ci
+
+            # Select grid for region i
+            grid_i = self.g if self.obs_list[i] else self.g_fine
+            xi_local = grid_i.vs[0]
+            yi_local = grid_i.vs[1]
+
+            dx_i = xi_local[1] - xi_local[0]
+            dy_i = yi_local[1] - yi_local[0]
+
+            # Global grid for region i
+            xi = xi_local + cx_i
+            yi = yi_local + cy_i
+            Xi, Yi = np.meshgrid(xi, yi, indexing="ij")
+
+            mask_i = phi_i <= level
+
+            for j in range(i + 1, N):
+
+                cj = self.safe_regions[j]
+                cx_j, cy_j, rj = cj
+
+                # # Fast disk pruning
+                # if np.linalg.norm(ci[:2] - cj[:2]) > ri + rj:
+                #     continue
+
+                phi_j = self.feasible_region[j]
+
+                # Select grid for region j
+                grid_j = self.g if self.obs_list[j] else self.g_fine
+                xj_local = grid_j.vs[0]
+                yj_local = grid_j.vs[1]
+
+                # Build interpolator for φ_j (local coordinates)
+                interp_j = RegularGridInterpolator(
+                    (xj_local, yj_local),
+                    phi_j,
+                    bounds_error=False,
+                    fill_value=np.inf
+                )
+
+                # Convert global coords to j-local coords
+                pts_j = np.stack([
+                    (Xi - cx_j).ravel(),
+                    (Yi - cy_j).ravel()
+                ], axis=-1)
+
+                phi_j_on_i = interp_j(pts_j).reshape(phi_i.shape)
+                mask_j = phi_j_on_i <= level
+
+                overlap_area = np.count_nonzero(mask_i & mask_j) * dx_i * dy_i
+
+                if overlap_area > area_tol:
+                    overlap_list[i].append(j)
+                    overlap_list[j].append(i)
+
+        return overlap_list
+
+
+
+
+

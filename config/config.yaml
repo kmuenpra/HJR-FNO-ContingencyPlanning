@@ -1,0 +1,19 @@
+#envronment configs
+map_1:
+  x_range: [0,10]
+  y_range: [0,8]
+  grid: [5, 4] #arbitrary integer input (n, m)
+  obs: [[3,3], [7,5], [7,7]] #list of obstacles defined by cartesian coordinate in environment map
+  des_region: [[5,7], [9,5]] #list of desired region  defined by cartesian coordinate in environment map
+
+map_2:
+  x_range: [0,10]
+  y_range: [0,8]
+  grid: [5, 4] #arbitrary integer input (n, m)
+  obs: [[3,3], [7,5], [7,7]] #list of obstacles defined by cartesian coordinate in environment map
+  des_region: [[9,3], [9,5]] #list of desired region  defined by cartesian coordinate in environment map
+
+#start and goal location in cartesian coordinate
+# NOTE: the code will find the nearest grid, according to the location
+start: [0,0]
+goal: [10,8]

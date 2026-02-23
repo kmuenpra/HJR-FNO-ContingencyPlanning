@@ -21,7 +21,7 @@ class Utils:
     def __init__(self, environment:env.Env):
         self.env = environment
 
-        self.delta = 3
+        self.delta = 0.5
         self.obs_circle = self.env.obs_circle
         self.obs_rectangle = self.env.obs_rectangle
         self.obs_boundary = self.env.obs_boundary
@@ -91,7 +91,7 @@ class Utils:
         #Projection of circle center onto the ray
         d2 = np.dot(d, d)
         
-        if d2 == 0:
+        if d2 < 1e-12:
             return False
 
         t = np.dot([a[0] - o[0], a[1] - o[1]], d) / d2
@@ -237,7 +237,7 @@ class Utils:
         d = np.sqrt((obs[:, 0] - x_r)**2 + (obs[:, 1] - y_r)**2)
 
         # Detection condition
-        detected_mask = np.abs(d - self.sensing_radius) <= (obs[:, 2] / 3.0)
+        detected_mask = (np.abs(d - self.sensing_radius) <= (obs[:, 2] / 4.0)) | (d <= self.sensing_radius)
 
         if not np.any(detected_mask):
             return self.unknown_obs_circle, []
