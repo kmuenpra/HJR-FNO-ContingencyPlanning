@@ -2,17 +2,37 @@
 Environment for rrt_2D
 @author: huiming zhou
 """
-
+import numpy as np
 
 class Env:
     def __init__(self, safe_regions=[]):
         self.x_range = (-25, 25)
         self.y_range = (-25, 25)
+        self.safe_regions = safe_regions
         self.obs_boundary = self.obs_boundary()
         self.obs_circle = self.obs_circle()
         self.obs_rectangle = self.obs_rectangle()
         self.unknown_obs_circle = self.unknown_obs_circle()
-        self.safe_regions = safe_regions
+
+        filtered_obs = []
+
+        for ox, oy, orad in self.unknown_obs_circle:
+            intersects = False
+
+            for sx, sy, srad in self.safe_regions:
+                d = np.hypot(ox - sx, oy - sy)
+
+                if d < orad + srad:
+                    intersects = True
+                    break
+
+            if not intersects:
+                filtered_obs.append([ox, oy, orad])
+
+        self.unknown_obs_circle = filtered_obs
+
+        
+            
 
     @staticmethod
     def obs_boundary():
@@ -51,10 +71,10 @@ class Env:
     @staticmethod
     def unknown_obs_circle():
         obs_cir = [
-        # [-5.0,   4.0,  1.5],
-        # [-6.0,  -6.0,  2.0],
-        # [ 7.0,   7.0,  1.0],
-        # [-10.0, -10.0, 1.8],
+        [-5.0,   4.0,  1.5],
+        [-6.0,  -6.0,  2.0],
+        [ 7.0,   7.0,  1.0],
+        [-10.0, -10.0, 1.8],
         [10, 6, 1.3],
         [-3.5, 7, 1.3],
         [ 0.0,  12.0,  1.6],
@@ -65,9 +85,10 @@ class Env:
         [  6.0,  16.0, 1.6],
         [ -12.0,   10.0, 1.7],
         [ -14.0,  3.0, 1.7],
-        [ -16.0, -4.0, 1.5],
+        [ -16.0, -4.0, 1.5], #[-16, -4]
         [ -9.0,  18.0, 1.8],
         [  3.0,   1.0, 1.2],
+        [-2.5, -3.5, 1.3]
         ]
         return obs_cir
 

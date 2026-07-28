@@ -1,5 +1,40 @@
-/__pycache__
-/reference\ algorithms/rrt_2D/__pycache__
-/reference\ algorithms/rrt_3D/__pycache__
+# --- Python / editors ---
+__pycache__/
+*.py[cod]
 /.venv
 /.idea
+.ipynb_checkpoints/
+
+# --- Evaluation benchmark (3.2 GB of cached results) ---
+eval/
+
+# --- Trained models, checkpoints, datasets ---
+*.pt
+*.pth
+*.ckpt
+*.mat
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.pkl
+
+# Directories holding trained FNO models / checkpoints / training data
+HJR_FNO/training/model/
+HJR_FNO/training/HJB_training_mat/
+HJR_FNO/training/fig_results/
+HJR_FNO/data_gen/HJB_training_mat/
+optimized_dp/plots/
+optimized_dp/references/
+
+# --- Generated experiment output / media ---
+exp_results/
+video/
+*.gif
+*.mp4
+
+
+summary_docs/
+
+# Note: HJR_FNO/model/ is intentionally NOT ignored - those are the small
+# (~2 MB) deployed models loaded at runtime and are already tracked.

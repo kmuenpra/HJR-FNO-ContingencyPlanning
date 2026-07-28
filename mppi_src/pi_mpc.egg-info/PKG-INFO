@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: pi-mpc
+Version: 0.1.0
+Summary: PyTorch implementation of Model Predictive Path Integral (MPPI) Control with GPU acceleration
+Requires-Python: <3.14,>=3.10
+License-File: LICENSE
+Requires-Dist: scipy>=1.15.3
+Requires-Dist: torch>=2.5.0
+Provides-Extra: example
+Requires-Dist: fire>=0.7.1; extra == "example"
+Requires-Dist: gymnasium[all]>=1.2.3; extra == "example"
+Requires-Dist: matplotlib>=3.10.8; extra == "example"
+Requires-Dist: moviepy>=2.2.1; extra == "example"
+Requires-Dist: mujoco>=3.4.0; extra == "example"
+Requires-Dist: numpy>=2.2.6; extra == "example"
+Requires-Dist: pandas>=2.3.3; extra == "example"
+Requires-Dist: pyqt5>=5.15.11; extra == "example"
+Requires-Dist: tqdm>=4.67.1; extra == "example"
+Dynamic: license-file

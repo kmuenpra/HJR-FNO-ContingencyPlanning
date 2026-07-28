@@ -458,8 +458,10 @@ class HJR_FNO:
         self.device = device
         
         # save_path = Path(__file__).resolve().parent / "model/hjrno_dubins_best_so_far"
+        # save_path = '/home/kmuenpra/git/HJR-FNO-ContingencyPlanning/HJR_FNO/model/hjrno_dubins_backup0'
+        save_path = '/home/kmuenpra/git/HJR-FNO-ContingencyPlanning/test/model/hjrno_dubins_PlaneDisturb_2500'
         # save_path = "/home/kmuenpra/git/HJR-FNO-ContingencyPlanning/test/model/hjrno_dubins_2_1"
-        save_path = '/home/kmuenpra/git/HJR-FNO-ContingencyPlanning/test/model/hjrno_dubins_2_4'
+        # save_path = '/home/kmuenpra/git/HJR-FNO-ContingencyPlanning/test/model/hjrno_dubins_2_4'
 
         if not os.path.exists(save_path):
             raise FileNotFoundError(f"HJR-FNO model not found at {save_path}")
@@ -476,8 +478,8 @@ class HJR_FNO:
         
         #Define 3D Plane dynamics
         x_init = np.array([0, 0, 0])
-        self.wMax = 1
-        self.vrange = [0, 1.5]
+        self.wMax = 1.5
+        self.vrange = [0, 1] #1.5
         self.dMax = [0, 0, 0]
         self.plane = Plane(x_init, self.wMax, self.vrange, self.dMax)
         
@@ -485,7 +487,7 @@ class HJR_FNO:
         # Define grid 
         self.grid_min = np.array([-10.0, -10.0, 0.0])
         self.grid_max = np.array([10.0, 10.0, 2 * math.pi])
-        self.N = np.array([100, 100, 17, 17]) #Dimension for [x,y,theta] ;  original (50,50,25)
+        self.N = np.array([50, 50, 25, 17]) #Dimension for [x,y,theta] ;  original (50,50,25)
         self.pd = [2]  # theta is periodic
 
         self.g = Grid(
@@ -577,8 +579,8 @@ class HJR_FNO:
             
             
 
-        self.safe_margin = -0.615 #ensure safe set is within V(x,y) <= safe_margin < 0
-        
+        self.safe_margin = -0.442144173607687#-0.55 #-0.615 #ensure safe set is within V(x,y) <= safe_margin < 0
+
         print(self.build_overlap_index_list(level=self.safe_margin, area_tol=0.0))
         
         
@@ -759,8 +761,8 @@ class HJR_FNO:
         # Iterate through each safe region that we want to update
         for i in range(self.num_safe_regions):
             x_offset, y_offset , _ = self.safe_regions[i]
-            
-            update_HJR_set = False 
+
+            update_HJR_set = False
             
             for obs in obs_cir:
                 x,y,r = obs
@@ -808,7 +810,7 @@ class HJR_FNO:
                 Tf_slice = np.argmin(np.abs(self.time_array_fine - self.Tf_reach))
                 
             self.feasible_region[i] = np.max(reach_i[..., Tf_slice], axis=2)
-            
+
     def check_hj_descent_grid(self,
                            grid,
                            V_raw,        # (Nx, Ny, Ntheta, Nt)
@@ -1072,7 +1074,7 @@ class HJR_FNO:
             local_empty = local_positions[idx_empty]
 
             # rows_e = self.xs_to_rows(local_empty[:, 0], N=self.N_fine).astype(int)
-            # cols_e = self.ys_to_cols(local_empty[:, 1], N=self.N_fine).astype(int)            
+            # cols_e = self.ys_to_cols(local_empty[:, 1], N=self.N_fine).astype(int)
 
 
             # #Collect all look-up values from the HJB sets
@@ -1080,13 +1082,13 @@ class HJR_FNO:
             #     self.feasible_region[closest_idx[i]][rows_e[k], cols_e[k]]
             #     for k, i in enumerate(idx_empty)
             # ])
-            
-            
+
+
             # # Check feasibility: inside reachable set
             # if np.any( vals_e > self.safe_margin):
             #     return False
-            
-            
+
+
             '''
             use RegularGridInterpolator
             '''
@@ -1106,7 +1108,7 @@ class HJR_FNO:
                 )
 
                 vals_e[mask] = interp(pts)
-                
+
             # Check feasibility: inside reachable set
             if np.any( vals_e > self.safe_margin - 0.06):
                 return False
@@ -1125,12 +1127,12 @@ class HJR_FNO:
             #     self.feasible_region[closest_idx[i]][rows_n[k], cols_n[k]]
             #     for k, i in enumerate(idx_nonempty)
             # ])
-            
+
             #  # Check feasibility: inside reachable set
             # if np.any( vals_n > self.safe_margin):
             #     return False
-            
-            
+
+
             '''
             use RegularGridInterpolator
             '''
@@ -1150,7 +1152,7 @@ class HJR_FNO:
                 )
 
                 vals_n[mask] = interp(pts)
-                
+
             # Check feasibility: inside reachable set
             if np.any( vals_n > self.safe_margin - 0.06):
                 return False
@@ -1159,8 +1161,8 @@ class HJR_FNO:
         return True
 
 
-            
-        
+
+
     def is_feasible_old(self, v:Tuple, reachable_set_constraint=True) -> bool:
         
         #TODO instead of finding the closest index, it might be better to predict for HJR-FNO at the current state (might be faster)
@@ -1461,7 +1463,7 @@ class HJR_FNO:
     
     
 
-    def contingency_policy(self, robot_state:List, plotting, fig:Figure, ax:Axes, showplot=True):
+    def contingency_policy(self, robot_state:List, plotting, fig:Figure, ax:Axes, showplot=True, special_case=False):
     
         
         closest_idx_list = self.find_feasible_closest_region(robot_pose=np.array(robot_state[:2]), returnList=True)
@@ -1493,7 +1495,7 @@ class HJR_FNO:
         # Extract reordered indices
         reordered_top3 = [idx for idx, _ in heading_deviation]
         
- 
+        lcp = 0
         for i in range(len(reordered_top3)):
             
             closest_idx = reordered_top3[i]
@@ -1567,7 +1569,8 @@ class HJR_FNO:
             # Check if robot is in any BRS (if not, we have a problem)
             if tEarliest >= tauLength - 1:
                 print("Warning: Robot state is near boundary of reachable set!")
-                continue
+                return [], np.array([robot_state]), 999, True, None, None, None 
+                # continue
             
             break
         #-----  End of iterating over potential closest feasible region ---- 
@@ -1575,7 +1578,11 @@ class HJR_FNO:
     
     
         # State-based time tracking
-        t = time_array[-1] #time_array[tEarliest]
+        # if lcp == 999:
+        #     t = time_array[-1]
+        # else:
+        t = time_array[tEarliest] #time_array[tEarliest]
+        first_time = t
         t_max = self.tf
         trajectory = np.array([x_r, y_r, theta])
 
@@ -1666,37 +1673,18 @@ class HJR_FNO:
             else:
                 obstacle_term = 0
 
-            print(
-                f"t = {t:.3f}, "
-                f"DtV+H: {ham_term:.3f} ({ham_term <= 0}), "
-                f"g-V: {obstacle_term:.3f} ({obstacle_term <= 0}), "
-                f"V(x): {V_val:.3f} ({V_val <= 0})"
-            ) 
-            
-            
-
-            # Check Ldot <= 0
-         
-            
-            # # 2. Evaluate value function at x
-            # L_val = self.eval_value_at_state(grid, self.safeSet_SDF, self.plane.x)
-
-            # # 3. Spatial gradient
-            # Deriv = computeGradients(grid, self.safeSet_SDF)
-            # grad_L = eval_u(grid, Deriv, self.plane.x)   # [Vx, Vy, Vtheta]
-            # u = self.plane.optCtrl(0, self.plane.x, grad_L, 'min')
-
             # print(
-            #     f" - "
-            #     f"L(x): {L_val}, "
-            #     f"grad L(x): {grad_L}, "
-            #     f"opt Control: {u}"
-            # )      
+            #     f"t = {t:.3f}, "
+            #     f"DtV+H: {ham_term:.3f} ({ham_term <= 0}), "
+            #     f"g-V: {obstacle_term:.3f} ({obstacle_term <= 0}), "
+            #     f"V(x): {V_val:.3f} ({V_val <= 0})"
+            # ) 
+            
 
             
             pde_tol = 15e-3
             fallback_plan = False
-            if ham_term > 0 or V_val > safe_margin:
+            if ham_term > 0: #or V_val > 0:
                 
                 fallback_plan = True
                     
@@ -1841,7 +1829,51 @@ class HJR_FNO:
                 else:
                     time_array = self.time_array_fine #finer discretization for no obstacle case (since we precomputed this)
                     grid = self.g_fine
-                dtSmall = (time_array[1] - time_array[0]) / subSamples
+                
+                if len(detected_obs) > 0:
+                    #Find minimum time set again when raechable set is updated
+                    theta_slice = np.argmin(np.abs(grid.vs[2] - self.plane.x[2]))
+                    tauLength = len(time_array)
+                    subSamples = 8
+                    dtSmall = (time_array[1] - time_array[0]) / subSamples
+                    
+                    # Binary search for the smallest time index where state is in BRS
+                    upper = tauLength - 1
+                    lower = 0
+                    
+                    def is_in_BRS(time_idx):
+                        """Check if current state is inside BRS at given time index"""
+                        # Convert continuous position to grid indices
+                        rows = self.xs_to_rows(np.array([self.plane.x[0]]), N=grid.N)
+                        cols = self.ys_to_cols(np.array([self.plane.x[1]]), N=grid.N)
+                        row = int(rows[0])
+                        col = int(cols[0])
+                        
+                        # Check bounds
+                        if not (0 <= row < data_safe.shape[0] and 0 <= col < data_safe.shape[1]):
+                            return False
+                            
+                        return data_safe[row, col, theta_slice, time_idx] <= self.safe_margin
+                    
+                    # Binary search to find the minimum time index where state is in BRS
+                    tEarliest = tauLength  # Default: not in any BRS
+                    while lower <= upper:
+                        mid = (lower + upper) // 2
+                        if is_in_BRS(mid):
+                            tEarliest = mid  # Found a valid index, try to find smaller
+                            upper = mid - 1
+                        else:
+                            lower = mid + 1
+                            
+                    # Check if trajectory has reached the target (smallest set)
+                    if tEarliest == 0:
+                        print("Trajectory has entered the target!")
+                        return [], np.array([robot_state]), first_time - t, True, None, None, None    # Already at target, no contingency needed
+                    
+                    if tEarliest < tauLength:
+                        first_time += time_array[tEarliest] - t
+                        t = time_array[tEarliest]
+                        
                     
             #Update obstacles for plotting and collision checking   
             plotting.update_obs(obs_circle, self.utils.obs_boundary, [], self.utils.unknown_obs_circle) # for plotting obstacles
@@ -1851,19 +1883,18 @@ class HJR_FNO:
             # Plot contingency plan
             ax.clear()
             
-            fig.suptitle(f"HJR-FNO Contincgency\n Safe Region: {self.safe_regions[closest_idx][:2]} | Time to Target: {self.tf - t:.2f}s")
-
+            # fig.suptitle(f"HJR-FNO Contincgency\n Safe Region: {self.safe_regions[closest_idx][:2]} | Time to Target: {self.tf - t:.2f}s")
+            fig.suptitle(
+                rf"$\theta = {self.plane.x[2]:.2f}\,\mathrm{{rad}},\; t = {t:.2f}\,\mathrm{{s}}$"
+            )
+            
             # restore static axis properties
             # ax.set_xlim(self.env.x_range[0], self.env.x_range[1] + 1)
             # ax.set_ylim(self.env.y_range[0], self.env.y_range[1] + 1)
             ax.set_xlim(self.grid_min[0] + self.safe_regions[closest_idx][0], self.grid_max[0] + self.safe_regions[closest_idx][0])
             ax.set_ylim(self.grid_min[1] + self.safe_regions[closest_idx][1], self.grid_max[1] + self.safe_regions[closest_idx][1])
 
-            # draw environment
-            plotting.plot_env(ax)
             
-            # draw robot + lidar + heading
-            plotting.plot_robot(ax, [x_r, y_r], self.utils.sensing_radius)
             
             arrow_len = 0.03 * max(self.env.x_range[1] - self.env.x_range[0],  self.env.y_range[1] - self.env.y_range[0])
             dx = arrow_len * np.cos(theta)
@@ -1902,7 +1933,8 @@ class HJR_FNO:
                 Z = data_union[..., theta_slice]
 
                 # mask out values > 0
-                Z_masked = np.ma.masked_where(Z > 0, Z)
+                # Z_masked = np.ma.masked_where(Z > self.safe_margin, Z)
+                Z_masked = np.ma.masked_where(Z >0, Z)
                 
                 # rows = self.xs_to_rows(np.array([self.plane.x[0]]), N=grid.N)
                 # cols = self.ys_to_cols(np.array([self.plane.x[1]]), N=grid.N)
@@ -1924,41 +1956,73 @@ class HJR_FNO:
 
                 
                 
-                CS = ax.contour(
-                        grid.xs[0][...,0] + self.safe_regions[closest_idx][0],
-                        grid.xs[1][...,0] + self.safe_regions[closest_idx][1],
-                        Z ,
-                        levels=[self.safe_margin],
-                        colors='magenta',
-                        linewidths=2
-                )   
+                # CS = ax.contour(
+                #         grid.xs[0][...,0] + self.safe_regions[closest_idx][0],
+                #         grid.xs[1][...,0] + self.safe_regions[closest_idx][1],
+                #         Z ,
+                #         levels=[self.safe_margin],
+                #         colors='magenta',
+                #         linewidths=2
+                # )   
                 
                 CS2 = ax.contour(
                         grid.xs[0][...,0] + self.safe_regions[closest_idx][0],
                         grid.xs[1][...,0] + self.safe_regions[closest_idx][1],
                         Z ,
-                        levels=[0],
-                        colors='green',
-                        linewidths=2
+                        levels=[0], #self.safe_margin
+                        colors='#191970',
+                        linewidths=2,
+                        linestyles='solid'
                 )   
+
+                # ax.grid(True)
                 
                 
+                # ========
+                # Extra
+                # ========
+                # if special_case:
+                #     if t >= 5.5:
+                #         mat_data = loadmat(f'/home/kmuenpra/git/HJR-FNO-ContingencyPlanning/test/HJB_training_mat/true_data6_1.mat')
+                #     else:
+                #         mat_data = loadmat(f'/home/kmuenpra/git/HJR-FNO-ContingencyPlanning/test/HJB_training_mat/true_data6_2.mat')
+                #     reachable_set = mat_data['data_safe']
+                    
+                #     CS2 = ax.contour(
+                #             self.g_fine.xs[0][...,0] + self.safe_regions[closest_idx][0],
+                #             self.g_fine.xs[1][...,0] + self.safe_regions[closest_idx][1],
+                #             reachable_set[:,:,theta_slice, brt_time_slice],
+                #             levels=[0],
+                #             colors='green',
+                #             linewidths=2
+                #     )  
+                #     ax.set_axis_off()
+                    
+                #     if t%(0.5) == 0:
+                #         # Save SVG for this iteration
+                #         filename = os.path.join("HJR_FNO/figures", f"reachable_{t}.svg")
+                #         fig.savefig(filename, format="svg", bbox_inches="tight")
                 
-                ax.grid(True)
+                # draw environment
+                plotting.plot_env(ax)
+                # draw robot + lidar + heading
+                plotting.plot_robot(ax, [x_r, y_r], self.utils.sensing_radius)
                 
+                
+                                
                 plt.pause(0.3) #original 0.3s     
             
             
-            # if reach the safe set early
-            if (self.plane.x[0]**2 + self.plane.x[1]**2) <= (2)**2:
+            # # if reach the safe set early
+            # if (self.plane.x[0]**2 + self.plane.x[1]**2) <= (2)**2:
                 
-                if not success and g_val_failed <= 0:
-                    success = True
-                    V_val_failed = None
-                    g_val_failed = None
-                    ham_failed    = None
+            #     if ((g_val_failed is None) or (g_val_failed <= 0)):
+            #         success = True
+            #         # V_val_failed = None
+            #         # g_val_failed = None
+            #         # ham_failed    = None
                 
-                return detected_obs_list, trajectory, (t_max-t), success, V_val_failed, g_val_failed, ham_failed 
+            #     return detected_obs_list, trajectory, (first_time-t), success, V_val_failed, g_val_failed, 0 
             
             
             #---------- Fallback Plan checking --------------
@@ -1980,9 +2044,14 @@ class HJR_FNO:
                 obstacle_term = 0
             
             #Check HJ condition for g(x)>0 or V>0
-            if obstacle_term > 0 or V_val > 0:
-                success  = False   
+            if obstacle_term > 0:
+                
+                success  = False 
                 g_val_failed = g_val 
+                
+            if V_val > 0 and (self.plane.x[0]**2 + self.plane.x[1]**2) > (2)**2:
+                
+                success  = False   
                 V_val_failed = V_val
                 
             if ham_term > 0 and not success:
@@ -1992,7 +2061,7 @@ class HJR_FNO:
             t = t_next 
             
         #In the end if it does not reach safe set, then consider fails
-        if (self.plane.x[0]**2 + self.plane.x[1]**2) > (2)**2:    
+        if (self.plane.x[0]**2 + self.plane.x[1]**2) > (2.2)**2:    
             success = False
          
                 
@@ -2000,7 +2069,7 @@ class HJR_FNO:
         V_val_failed = V_val
         g_val_failed = g_val
         ham_failed = ham_term
-        return detected_obs_list, trajectory, t_max, success, V_val_failed, g_val_failed, ham_failed
+        return detected_obs_list, trajectory, first_time, success, V_val_failed, g_val_failed, ((self.plane.x[0]**2 + self.plane.x[1]**2) - 4)
     
     
     def contingency_policy_newTest(self, robot_state:List, plotting, fig:Figure, ax:Axes):
@@ -2088,7 +2157,7 @@ class HJR_FNO:
                 if not (0 <= row < data_safe.shape[0] and 0 <= col < data_safe.shape[1]):
                     return False
                     
-                return data_safe[row, col, theta_slice, time_idx] <= self.safe_margin
+                return data_safe[row, col, theta_slice, time_idx] <= 0 #self.safe_margin
             
             # Binary search to find the minimum time index where state is in BRS
             tEarliest = tauLength  # Default: not in any BRS
@@ -2596,6 +2665,206 @@ class HJR_FNO:
         return overlap_list
 
 
+# =====================================================================
+# Main: super-resolution demo with random circular obstacles
+#       (animated GIF over time slices, fixed theta = 0)
+# =====================================================================
+if __name__ == "__main__":
+    from matplotlib.patches import Circle
 
+    # -----------------------------------------------------------
+    # Config
+    # -----------------------------------------------------------
+    MODEL_PATH = '/home/kmuenpra/git/HJR-FNO-ContingencyPlanning/test/model/hjrno_dubins_PlaneDisturb_2500'
+    device     = 'cuda' if torch.cuda.is_available() else 'cpu'
+
+    grid_min = np.array([-10.0, -10.0, 0.0])
+    grid_max = np.array([ 10.0,  10.0, 2 * math.pi])
+    N_theta  = 25
+    pd       = [2]
+
+    theta_array = np.linspace(0.0, 2 * math.pi, N_theta)
+    time_array  = np.linspace(0.0, 8.0, 17)
+
+    resolutions = [30, 100, 500]
+
+    # Fixed theta = 0 for animation (closest grid index)
+    th_i = int(np.argmin(np.abs(theta_array - 0.0)))
+    theta_val = float(theta_array[th_i])
+
+    # -----------------------------------------------------------
+    # Load FNO weights
+    # -----------------------------------------------------------
+    print(f"Loading FNO from: {MODEL_PATH}")
+    model = torch.load(MODEL_PATH, weights_only=False, map_location=device)
+    model.to(device)
+    model.eval()
+
+    # -----------------------------------------------------------
+    # Generate random scene: >= 3 obstacles, each >= 2 units from origin
+    # -----------------------------------------------------------
+    seed = np.random.randint(0, 10_000)
+    rng  = np.random.default_rng(seed)
+    n_obs = int(rng.integers(3, 6))   # 3 to 5 obstacles
+
+    scene_centers = []
+    scene_radii   = []
+    MIN_ORIGIN_DIST = 2.0
+    PLACEMENT_RANGE = 6.0
+
+    while len(scene_centers) < n_obs:
+        cx = float(rng.uniform(-PLACEMENT_RANGE, PLACEMENT_RANGE))
+        cy = float(rng.uniform(-PLACEMENT_RANGE, PLACEMENT_RANGE))
+        r  = float(rng.uniform(0.6, 1.3))
+        # Reject if obstacle disk overlaps the origin ball of radius MIN_ORIGIN_DIST
+        if math.hypot(cx, cy) - r < MIN_ORIGIN_DIST:
+            continue
+        scene_centers.append((cx, cy))
+        scene_radii.append(r)
+
+    print(f"Seed={seed}  n_obs={n_obs}")
+    for c, r in zip(scene_centers, scene_radii):
+        print(f"  center=({c[0]:+.2f}, {c[1]:+.2f})  radius={r:.2f}  "
+              f"dist_origin={math.hypot(*c):.2f}")
+
+    def build_grid(N_xy):
+        return Grid(grid_min, grid_max, np.array([N_xy, N_xy, N_theta]), pd)
+
+    def scene_sdf_xy(g):
+        """Union SDF of all cylinders, evaluated on (x,y) of grid g."""
+        Xg, Yg = np.meshgrid(g.vs[0], g.vs[1], indexing="ij")
+        sdf = np.sqrt((Xg - scene_centers[0][0])**2
+                      + (Yg - scene_centers[0][1])**2) - scene_radii[0]
+        for (cx, cy), r in zip(scene_centers[1:], scene_radii[1:]):
+            sdf = np.minimum(sdf,
+                             np.sqrt((Xg - cx)**2 + (Yg - cy)**2) - r)
+        return sdf
+
+    def fno_query(g, sdf_xy):
+        """Run FNO at arbitrary resolution. Returns (H, W, TH, T) numpy."""
+        H, W = g.N[0], g.N[1]
+        TH, T = len(theta_array), len(time_array)
+        Xg, Yg = np.meshgrid(g.vs[0], g.vs[1], indexing="ij")
+        X_flat, Y_flat = Xg.reshape(-1), Yg.reshape(-1)
+        N_pts = H * W
+        sdf_flat = sdf_xy.reshape(-1)
+
+        batch_size = T * TH
+        xx_query = torch.empty(batch_size, N_pts, 5, dtype=torch.float32)
+
+        j = 0
+        for t_idx in range(T):
+            for th_idx in range(TH):
+                xx_query[j, :, 0] = torch.from_numpy(sdf_flat).float()
+                xx_query[j, :, 1] = torch.from_numpy(X_flat).float()
+                xx_query[j, :, 2] = torch.from_numpy(Y_flat).float()
+                xx_query[j, :, 3] = float(theta_array[th_idx])
+                xx_query[j, :, 4] = float(time_array[t_idx])
+                j += 1
+
+        pred = torch.zeros(batch_size, N_pts)
+        chunk = 8
+        with torch.no_grad():
+            for i in range(0, batch_size, chunk):
+                out = model(xx_query[i:i + chunk].to(device))
+                pred[i:i + chunk] = out.squeeze(-1).cpu()
+
+        pred_reshaped = torch.zeros(H, W, TH, T)
+        idx = 0
+        for t_idx in range(T):
+            for th_idx in range(TH):
+                pred_reshaped[:, :, th_idx, t_idx] = pred[idx].reshape(H, W)
+                idx += 1
+        return pred_reshaped.numpy()
+
+    # -----------------------------------------------------------
+    # Pre-compute predictions at every resolution
+    # -----------------------------------------------------------
+    results = {}   # N_xy -> dict(grid, sdf_xy, pred, V_min, V_max)
+    for N_xy in resolutions:
+        print(f"\n--- Running FNO at {N_xy} x {N_xy} ---")
+        g_res  = build_grid(N_xy)
+        sdf_xy = scene_sdf_xy(g_res)
+        pred   = fno_query(g_res, sdf_xy)
+
+        # Z range for the chosen theta slice over all time (for stable colormap)
+        Z_theta = pred[:, :, th_i, :]
+        results[N_xy] = dict(
+            grid=g_res,
+            sdf_xy=sdf_xy,
+            pred=pred,
+            V_min=float(np.min(Z_theta)),
+            V_max=float(np.max(Z_theta)),
+        )
+        print(f"  V range (theta={theta_val:.2f}): "
+              f"[{results[N_xy]['V_min']:.3f}, {results[N_xy]['V_max']:.3f}]")
+
+    # -----------------------------------------------------------
+    # Build animation: one frame per time slice, 1x3 subplots
+    # -----------------------------------------------------------
+    fig, axes = plt.subplots(1, 3, figsize=(18, 6))
+
+    def draw_frame(t_idx):
+        for ax, N_xy in zip(axes, resolutions):
+            ax.clear()
+
+            r = results[N_xy]
+            g_res = r["grid"]
+            sdf_xy = r["sdf_xy"]
+            pred  = r["pred"]
+
+            Xg, Yg = np.meshgrid(g_res.vs[0], g_res.vs[1], indexing="ij")
+            extent = [g_res.vs[0][0], g_res.vs[0][-1],
+                      g_res.vs[1][0], g_res.vs[1][-1]]
+
+            Z = pred[:, :, th_i, t_idx]
+            Z_masked = np.ma.masked_where(Z > 0, Z)
+
+            # Same style as contingency_policy() plotting
+            ax.contourf(
+                Xg, Yg, Z_masked,
+                levels=50,
+                cmap="Blues_r",
+                vmin=r["V_min"],
+                vmax=r["V_max"],
+                alpha=0.7,
+            )
+            # Faint zero-level outline for clarity
+            if Z.min() < 0 < Z.max():
+                ax.contour(Xg, Yg, Z, levels=[0.0],
+                           colors="navy", linewidths=1.0, alpha=0.6)
+
+            # Obstacle SDF outline (red)
+            if sdf_xy.min() < 0 < sdf_xy.max():
+                ax.contour(Xg, Yg, sdf_xy, levels=[0.0],
+                           colors="red", linewidths=2)
+
+            # Unit circle at origin (light green outline)
+            ax.add_patch(Circle((0.0, 0.0), 1.0,
+                                edgecolor="lightgreen", facecolor="none",
+                                linewidth=2))
+
+            ax.set_aspect("equal")
+            ax.set_xlim(extent[0], extent[1])
+            ax.set_ylim(extent[2], extent[3])
+            ax.set_title(
+                f"FNO {N_xy} x {N_xy}\n"
+                f"theta={theta_val:.2f} rad, "
+                f"t={time_array[t_idx]:.2f}s"
+            )
+
+        fig.tight_layout()
+
+    anim = FuncAnimation(
+        fig, draw_frame,
+        frames=len(time_array),
+        interval=250,
+        repeat=True,
+    )
+
+    out_gif = "fno_superres_evolution.gif"
+    anim.save(out_gif, writer=PillowWriter(fps=4))
+    plt.close(fig)
+    print(f"\nSaved animation to: {out_gif}")
 
 

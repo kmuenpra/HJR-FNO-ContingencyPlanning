@@ -188,16 +188,16 @@ class Utils:
         dx = dest[0] - x
         dy = dest[1] - y
 
-        # desired_theta = math.atan2(dy, dx)
-        # heading_error = Utils.wrap_angle(desired_theta - theta)
+        desired_theta = math.atan2(dy, dx)
+        heading_error = Utils.wrap_angle(desired_theta - theta)
 
-        # omega = max(-w_max, min(w_max, heading_error / dt))
+        omega = max(-w_max, min(w_max, heading_error / dt))
 
-        # theta_new = Utils.wrap_angle(theta + omega * dt)
-        # x_new = x + v * dt * math.cos(theta_new)
-        # y_new = y + v * dt * math.sin(theta_new)
+        theta_new = Utils.wrap_angle(theta + omega * dt)
+        x_new = x + v * dt * math.cos(theta_new)
+        y_new = y + v * dt * math.sin(theta_new)
         
-        # return [x_new, y_new, theta_new % (2 * math.pi)] #return theta in domain [0, 2pi]
+        return [x_new, y_new, theta_new % (2 * math.pi)] #return theta in domain [0, 2pi]
         
         
         #Unicycle model
@@ -211,12 +211,12 @@ class Utils:
     def lidar_detected(self, robot_position):
         """
         @description 
-        Simulate a circular lidar sensor. 
-        The obstacle is detected when the obstacle center lies in a thin annulus around the sensing boundary 
-        
+        Simulate a circular lidar sensor.
+        The obstacle is detected when the obstacle center lies inside the sensing radius
+
         Detection rule:
         An obstacle is detected when the obstacle center lies within
-        |d - sensing_radius| <= r_i / 3.
+        the sensing radius, i.e. d <= sensing_radius.
         
         @params 
         - robot_position : (x, y) "Current robot position" 
@@ -237,7 +237,7 @@ class Utils:
         d = np.sqrt((obs[:, 0] - x_r)**2 + (obs[:, 1] - y_r)**2)
 
         # Detection condition
-        detected_mask = (np.abs(d - self.sensing_radius) <= (obs[:, 2] / 4.0)) | (d <= self.sensing_radius)
+        detected_mask = d <= self.sensing_radius
 
         if not np.any(detected_mask):
             return self.unknown_obs_circle, []
@@ -246,8 +246,9 @@ class Utils:
         detected_obstacles = obs[detected_mask].tolist()
         remaining_obstacles = obs[~detected_mask].tolist()
 
-        # Update unknown obstacle list
-        self.unknown_obs_circle = remaining_obstacles
+        # Update unknown obstacle list IN PLACE so the shared store identity is preserved
+        # (all trees + plotting reference the same list; rebinding would diverge them).
+        self.unknown_obs_circle[:] = remaining_obstacles
 
         return self.unknown_obs_circle, detected_obstacles
 

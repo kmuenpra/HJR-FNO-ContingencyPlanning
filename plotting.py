@@ -97,6 +97,7 @@ class Plotting:
                     linewidths=1.5,
                     zorder=10
                 )
+        
         # boundary obstacles
         for (ox, oy, w, h) in self.obs_bound:
             boundary_patch = patches.Rectangle(
@@ -145,7 +146,7 @@ class Plotting:
             for (ox, oy, r) in self.safe_regions:
                 circle_patch = patches.Circle(
                     (ox, oy), r,
-                    edgecolor='green',
+                    edgecolor="#25DC25",
                     facecolor='none',
                     linewidth = 3,
                 )
@@ -153,7 +154,7 @@ class Plotting:
                 ax.draw_artist(circle_patch)
 
 
-    def plot_robot(self, ax, robot_position, lidar_range=2.0):
+    def plot_robot(self, ax, robot_position, lidar_range=2.0, plot_lidar=True):
         #robot
         # start_patch = patches.Circle(
         #     (robot_position[0], robot_position[1]), 0.5,
@@ -170,18 +171,19 @@ class Plotting:
                    label='Current Position', zorder=6)
         
         #lidar
-        lidar_patch = patches.Circle(
-        (robot_position[0], robot_position[1]),
-        radius=lidar_range,
-        edgecolor='cyan',
-        facecolor='none',
-        linestyle='-',
-        linewidth=1.5,
-        alpha=0.8,
-        zorder=4
-        )
-        ax.add_patch(lidar_patch)
-        ax.draw_artist(lidar_patch)
+        if plot_lidar:
+            lidar_patch = patches.Circle(
+            (robot_position[0], robot_position[1]),
+            radius=lidar_range,
+            edgecolor='cyan',
+            facecolor='none',
+            linestyle='--',
+            linewidth=1.5,
+            alpha=0.8,
+            zorder=4
+            )
+            ax.add_patch(lidar_patch)
+            ax.draw_artist(lidar_patch)
         
     
     def plot_reachable_set(self, ax, hjr_fno, theta, time):
@@ -195,28 +197,53 @@ class Plotting:
                 
                 '''reachable set'''
                 theta_slice = np.argmin(np.abs(hjr_fno.theta_array_fine - theta))
-                time_slice = np.argmin(np.abs(hjr_fno.time_array_fine - time))
+                # index 0 = fully grown: flip the ascending-time argmin
+                time_slice  = (len(hjr_fno.time_array_fine) - 1) - np.argmin(np.abs(hjr_fno.time_array_fine - time))
+
                 reachable_set_slice = reachable_set[..., theta_slice, time_slice]
                 
                 CS = ax.contour(
                     hjr_fno.X_fine + hjr_fno.safe_regions[i][0],
                     hjr_fno.Y_fine + hjr_fno.safe_regions[i][1],
                     reachable_set_slice,
-                    levels=[hjr_fno.safe_margin],
-                    colors='magenta',
-                    linewidths=2
+                    levels=[hjr_fno.safe_margin[i]],
+                    colors='#191970',
+                    linewidths=2,
+                    linestyles='solid'
                 )
-                
+
+                # filled feasible set {feasible_region <= safe_margin} (max over theta, fine grid; skip if empty)
+                fr = hjr_fno.feasible_region[i]
+                if hjr_fno.safe_margin[i] > fr.min():
+                    ax.contourf(
+                        hjr_fno.X_fine + hjr_fno.safe_regions[i][0],
+                        hjr_fno.Y_fine + hjr_fno.safe_regions[i][1],
+                        fr,
+                        levels=[fr.min(), hjr_fno.safe_margin[i]],
+                        colors='#ADD8E6',
+                        alpha=0.4
+                    )
+
                 '''feasible set'''
-                # CS = ax.contour(
+                # CS = ax.contourf(
                 #     hjr_fno.X_fine + hjr_fno.safe_regions[i][0],
                 #     hjr_fno.Y_fine + hjr_fno.safe_regions[i][1],
                 #     hjr_fno.feasible_region[i],
-                #     levels=[hjr_fno.safe_margin],
-                #     colors='green',
-                #     linewidths=2
+                #     levels=[hjr_fno.feasible_region[i].min(), hjr_fno.safe_margin[i]],
+                #     colors='#ADD8E6',
+                #     alpha=0.4
                 # )
                 
+                # ax.contour(
+                #     hjr_fno.X_fine + hjr_fno.safe_regions[i][0],
+                #     hjr_fno.Y_fine + hjr_fno.safe_regions[i][1],
+                #     hjr_fno.feasible_region[i],
+                #     levels=[hjr_fno.safe_margin[i]],
+                #     colors='cyan',
+                #     linewidths=2,
+                #     linestyles='solid',
+                # )
+                                
                 '''R-Funnel'''
                 # #Find R_funnel
                 # dx = (hjr_fno.grid_max[0] - hjr_fno.grid_min[0]) / (hjr_fno.N_fine[0] - 1)
@@ -264,8 +291,9 @@ class Plotting:
             else:
                 
                 '''reachable set'''
-                theta_slice = np.argmin(np.abs(hjr_fno.theta_array - theta))
-                time_slice = np.argmin(np.abs(hjr_fno.time_array - time))
+                theta_slice = np.argmin(np.abs(hjr_fno.theta_array[::-1] - theta))
+                # index 0 = fully grown: flip the ascending-time argmin (no time_array[::-1])
+                time_slice = (len(hjr_fno.time_array) - 1) - np.argmin(np.abs(hjr_fno.time_array - time))
                 
                 if torch.is_tensor(reachable_set):
                     reachable_set = reachable_set.detach().cpu().numpy()
@@ -275,23 +303,24 @@ class Plotting:
                     hjr_fno.X + hjr_fno.safe_regions[i][0],
                     hjr_fno.Y + hjr_fno.safe_regions[i][1],
                     reachable_set_slice,
-                    levels=[hjr_fno.safe_margin],
-                    colors='magenta',
-                    linewidths=2
+                    levels=[hjr_fno.safe_margin[i]],
+                    colors='#191970',
+                    linewidths=2,
+                    linestyles='solid'
                 )
-                
-                '''feasible set'''
-                # CS = ax.contour(
-                #     hjr_fno.X + hjr_fno.safe_regions[i][0],
-                #     hjr_fno.Y + hjr_fno.safe_regions[i][1],
-                #     hjr_fno.feasible_region[i],
-                #     levels=[hjr_fno.safe_margin],
-                #     colors='green',
-                #     linewidths=2
-                # )
-                
-                
-                
+
+                # filled feasible set {feasible_region <= safe_margin} (max over theta, coarse grid; skip if empty)
+                fr = hjr_fno.feasible_region[i]
+                if hjr_fno.safe_margin[i] > fr.min():
+                    ax.contourf(
+                        hjr_fno.X + hjr_fno.safe_regions[i][0],
+                        hjr_fno.Y + hjr_fno.safe_regions[i][1],
+                        fr,
+                        levels=[fr.min(), hjr_fno.safe_margin[i]],
+                        colors='#ADD8E6',
+                        alpha=0.4
+                    )
+
                 '''R-Funnel'''
                 #Find R_funnel
                 # dx = (hjr_fno.grid_max[0] - hjr_fno.grid_min[0]) / (hjr_fno.N[0] - 1)

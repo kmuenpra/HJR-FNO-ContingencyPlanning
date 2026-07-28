@@ -17,3 +17,5 @@ opt-einsum
 h5py
 zarr
 
+scikit-image
+
