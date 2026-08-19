@@ -15,6 +15,7 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)) +
 # from Sampling_based_Planning.rrt_2D.rrt import Node
 import env
 from rrtx import Node
+from eval.config import CFG
 
 
 class Utils:
@@ -27,7 +28,13 @@ class Utils:
         self.obs_boundary = self.env.obs_boundary
         self.unknown_obs_circle = self.env.unknown_obs_circle
         
-        self.sensing_radius = 2.0
+        # Lidar sensing radius used by lidar_detected(). Defaults to the shared
+        # constant (eval/config.yaml) rather than a local literal: every planner
+        # overwrites this attribute anyway, and the old 2.0 m default meant any
+        # Utils instance that nobody remembered to overwrite sensed at a third of
+        # the real range while looking perfectly healthy. Per-scenario overrides
+        # (env_C uses 8.0) are applied by the caller, which knows the scenario.
+        self.sensing_radius = CFG.lidar_radius
 
     def update_obs(self, obs_cir, obs_bound, obs_rec, unknown_obs_cir):
         self.obs_circle = obs_cir
@@ -176,15 +183,45 @@ class Utils:
         return (theta + math.pi) % (2 * math.pi) - math.pi 
 
     @staticmethod
-    def update_robot_position_dubins(state, dest, dt, v=1.0, w_max=1):
+    def update_robot_position_dubins(state, dest, dt, v=1.0, w_max=1, stop_at=None):
         """
-        Dubins car update with bounded angular velocity.
+        Dubins/unicycle update with bounded angular velocity: one pure-pursuit
+        control step toward ``dest``.
 
-        state  = [x, y, theta]
-        dest = [x_d, y_d]
+        Deliberately kept identical, formula for formula, to the pure-pursuit
+        tracker used for MPPI's topological guidance (mppi_src/guidance.py
+        ``TopoGuidance._track``) and to ``Navigation2DEnv.dynamics``, so that a
+        behavioural difference between the two planners is attributable to the
+        PLANNERS and not to their controllers:
+
+          omega = clip(wrap(atan2(dest - p) - theta) / dt, +-w_max)
+          x, y  = x, y + v*dt*(cos, sin)(theta)      <-- OLD theta
+          theta = wrap(theta + omega*dt)
+
+        Note the integration order: x/y step with the OLD heading and only then
+        is theta updated. This used to be the other way round (theta first, x/y
+        with the NEW heading), which turns slightly "early" compared with the env
+        and accumulates a systematic difference in turn geometry.
+
+        @params
+        - state   : [x, y, theta]
+        - dest    : [x_d, y_d]   the pursued point (a waypoint / lookahead point)
+        - dt      : integration timestep [s]. NOTE omega saturates whenever the
+                    heading error exceeds w_max*dt, so a small dt makes this a
+                    bang-bang turner; use the same dt as the env (0.1) to get
+                    comparable behaviour.
+        - v       : commanded speed [m/s]
+        - w_max   : angular-rate bound [rad/s]
+        - stop_at : optional (x, y) of the FINAL target. When given, the speed is
+                    tapered as v = min(v, ||stop_at - p|| / dt) so the robot
+                    cannot overshoot it -- the same taper the topo tracker applies
+                    at its path end.
+        @return [x_new, y_new, theta_new] with theta_new wrapped to [-pi, pi),
+                the convention used by the env, the tracker and the HJR grids.
         """
 
         x, y, theta = state
+        theta = Utils.wrap_angle(theta)          # accept either convention as input
         dx = dest[0] - x
         dy = dest[1] - y
 
@@ -193,17 +230,17 @@ class Utils:
 
         omega = max(-w_max, min(w_max, heading_error / dt))
 
+        # decelerate into the final target so a step cannot overshoot it
+        if stop_at is not None:
+            d_end = math.hypot(stop_at[0] - x, stop_at[1] - y)
+            v = max(0.0, min(v, d_end / dt))
+
+        # x/y step uses the OLD heading, then theta is updated (env convention)
+        x_new = x + v * dt * math.cos(theta)
+        y_new = y + v * dt * math.sin(theta)
         theta_new = Utils.wrap_angle(theta + omega * dt)
-        x_new = x + v * dt * math.cos(theta_new)
-        y_new = y + v * dt * math.sin(theta_new)
-        
-        return [x_new, y_new, theta_new % (2 * math.pi)] #return theta in domain [0, 2pi]
-        
-        
-        #Unicycle model
-        dist = v * dt
-        angle = math.atan2(dy, dx)
-        return [x + dist * math.cos(angle), y + dist * math.sin(angle), angle]
+
+        return [x_new, y_new, theta_new]
 
         
         

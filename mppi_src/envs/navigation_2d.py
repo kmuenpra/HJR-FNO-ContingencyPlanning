@@ -5,6 +5,8 @@ Kohei Honda, 2023.
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
 from typing import Tuple
 
 import numpy as np
@@ -14,6 +16,17 @@ from moviepy.video.io.ImageSequenceClip import ImageSequenceClip
 
 from envs.obstacle_map_2d import ObstacleMap, generate_random_obstacles
 
+# Shared fixed constants (eval/config.yaml) -- the same file the RRTX driver and
+# the HJR-FNO oracle read, so dt, the control bounds, the lidar radius and the
+# goal tolerance cannot drift between the two frameworks. The repo root is put
+# on sys.path here rather than by the caller because this module is imported as
+# ``envs.navigation_2d`` (sys.path[0] is mppi_src/), so ``eval`` is not yet
+# importable at this point.
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from eval.config import load_config  # noqa: E402
+
 
 @torch.jit.script
 def angle_normalize(x):
@@ -22,53 +35,83 @@ def angle_normalize(x):
 
 class Navigation2DEnv:
     def __init__(
-        self, device=torch.device("cuda"), dtype=torch.float32, seed: int = 42
+        self,
+        device=torch.device("cuda"),
+        dtype=torch.float32,
+        seed: int = 42,
+        scenario=None,
     ) -> None:
+        """
+        scenario: optional ``eval.scenarios.Scenario``. When given, the map size,
+            safe regions, obstacles, start, goal and lidar radius all come from it
+            instead of being generated here, so this env and the RRTX one solve
+            literally the same problem. ``scenario=None`` keeps the original
+            random-map behaviour unchanged.
+        """
         # device and dtype
         if torch.cuda.is_available() and device == torch.device("cuda"):
             self._device = torch.device("cuda")
         else:
             self._device = torch.device("cpu")
         self._dtype = dtype
+        self.scenario = scenario
+
+        # Fixed constants, with this scenario's overrides applied. A Scenario
+        # resolved its own copies from the same file at construction, so the two
+        # agree by construction; when one is given it wins, so a scenario loaded
+        # from a dumped .json still runs with the constants it was dumped with.
+        self.cfg = load_config(getattr(scenario, "name", None))
 
         self._obstacle_map = ObstacleMap(
-            map_size=(20, 20), cell_size=0.1, device=self._device, dtype=self._dtype
+            map_size=(20, 20) if scenario is None else scenario.map_size,
+            cell_size=0.1,
+            device=self._device,
+            dtype=self._dtype,
         )
         self._seed = seed
 
-        # safe regions (visualization only, no effect on the planner): fixed
-        # centers, defined before obstacles so obstacles can avoid them.
-        safe_radius = 2.0
-        safe_region_centers = [
-            (-5.0, -7.5),
-            (0.0, 0.0),
-            (-2.5, 5.0),
-            (5.0, 6.0),
-        ]
-        self.safe_regions = [(cx, cy, safe_radius) for cx, cy in safe_region_centers]
+        if scenario is not None:
+            # ---- fixed, shared scenario -------------------------------------
+            self.safe_regions = [tuple(map(float, r)) for r in scenario.safe_regions]
+            # all scenario obstacles are UNKNOWN ground truth; the map starts empty
+            # and the lidar fills it in step().
+            self._unknown_obs = [tuple(map(float, o)) for o in scenario.obstacles]
+        else:
+            # ---- original behaviour: random map -----------------------------
+            # safe regions: fixed centers, defined before obstacles so obstacles
+            # can avoid them.
+            safe_radius = 2.0
+            safe_region_centers = [
+                (-5.0, -7.5),
+                (0.0, 0.0),
+                (-2.5, 5.0),
+                (5.0, 6.0),
+            ]
+            self.safe_regions = [(cx, cy, safe_radius) for cx, cy in safe_region_centers]
 
-        # obstacles are constrained to not intersect any safe region
-        generate_random_obstacles(
-            obstacle_map=self._obstacle_map,
-            random_x_range=(-7.5, 7.5),
-            random_y_range=(-7.5, 7.5),
-            num_circle_obs=10,
-            radius_range=(0.5, 1.5),
-            num_rectangle_obs=0,
-            width_range=(2, 2),
-            height_range=(2, 2),
-            max_iteration=1000,
-            seed=seed,
-            keepout_circles=self.safe_regions,
-        )
+            # obstacles are constrained to not intersect any safe region
+            generate_random_obstacles(
+                obstacle_map=self._obstacle_map,
+                random_x_range=(-7.5, 7.5),
+                random_y_range=(-7.5, 7.5),
+                num_circle_obs=10,
+                radius_range=(0.5, 1.5),
+                num_rectangle_obs=0,
+                width_range=(2, 2),
+                height_range=(2, 2),
+                max_iteration=1000,
+                seed=seed,
+                keepout_circles=self.safe_regions,
+            )
 
-        # Treat all generated obstacles as UNKNOWN ground truth: snapshot them,
-        # then clear the map so it starts with no KNOWN obstacles. The lidar
-        # reveals obstacles incrementally (see step()), adding them to the map.
-        self._unknown_obs = [
-            (float(o.center[0]), float(o.center[1]), float(o.radius))
-            for o in self._obstacle_map.circle_obs_list
-        ]
+            # Treat all generated obstacles as UNKNOWN ground truth: snapshot them,
+            # then clear the map so it starts with no KNOWN obstacles. The lidar
+            # reveals obstacles incrementally (see step()), adding them to the map.
+            self._unknown_obs = [
+                (float(o.center[0]), float(o.center[1]), float(o.radius))
+                for o in self._obstacle_map.circle_obs_list
+            ]
+
         self._known_obs = []
         self._obstacle_map.clear()
         self._obstacle_map.convert_to_torch()
@@ -85,32 +128,65 @@ class Navigation2DEnv:
         self.obs_rectangle = []
         self.obs_boundary = []
 
+        start_xy = (-9.0, -9.0) if scenario is None else tuple(scenario.start[:2])
+        goal_xy = (8.0, 8.0) if scenario is None else tuple(scenario.goal)
         self._start_pos = torch.tensor(
-            [-9.0, -9.0], device=self._device, dtype=self._dtype
+            list(start_xy), device=self._device, dtype=self._dtype
         )
         self._goal_pos = torch.tensor(
-            [8.0, 8.0], device=self._device, dtype=self._dtype
+            list(goal_xy), device=self._device, dtype=self._dtype
+        )
+        # start heading: from the scenario if given, else point at the goal
+        self._start_theta = (
+            float(scenario.start[2])
+            if scenario is not None
+            else float(np.arctan2(goal_xy[1] - start_xy[1], goal_xy[0] - start_xy[0]))
         )
 
         self._robot_state = torch.zeros(3, device=self._device, dtype=self._dtype)
         self._robot_state[:2] = self._start_pos
         self._robot_state[2] = angle_normalize(
-            torch.atan2(
-                self._goal_pos[1] - self._start_pos[1],
-                self._goal_pos[0] - self._start_pos[0],
-            )
+            torch.tensor(self._start_theta, device=self._device, dtype=self._dtype)
         )
 
+        # control period [s]; the default for dynamics() and the study's Delta t_c
+        self._dt_c = float(self.cfg.dt_c)
+
         # u: [v, omega] (m/s, rad/s)
-        self.u_min = torch.tensor([0.0, -1.0], device=self._device, dtype=self._dtype)
-        self.u_max = torch.tensor([1.0, 1.0], device=self._device, dtype=self._dtype)
+        v_max = self.cfg.v_max if scenario is None else float(scenario.v_max)
+        w_max = self.cfg.omega_max if scenario is None else float(scenario.omega_max)
+        self.u_min = torch.tensor([0.0, -w_max], device=self._device, dtype=self._dtype)
+        self.u_max = torch.tensor([v_max, w_max], device=self._device, dtype=self._dtype)
 
         # lidar sensor: circular field of view centered on the robot
-        self.lidar_radius = 7.0
+        self.lidar_radius = (
+            self.cfg.lidar_radius if scenario is None else float(scenario.lidar_radius)
+        )
+        self.goal_threshold = (
+            self.cfg.goal_threshold
+            if scenario is None
+            else float(scenario.goal_threshold)
+        )
 
         # reachability oracle (HJR-FNO), attached after construction via
         # attach_reachability(); step() feeds it newly detected obstacles.
         self.hjr_fno = None
+
+        # True for exactly the step() calls in which the lidar revealed new
+        # obstacles (so the reachable set was just updated). The topological
+        # guidance layer uses this as its replan trigger.
+        self._obs_revealed = False
+
+    # World extents under the names the HJR-FNO oracle reads off its ``env``
+    # (rrtx's env.Env exposes these; contingency_policy uses them to scale its
+    # heading arrow). Sourced from the occupancy grid so they cannot drift.
+    @property
+    def x_range(self) -> Tuple[float, float]:
+        return tuple(self._obstacle_map.x_lim)
+
+    @property
+    def y_range(self) -> Tuple[float, float]:
+        return tuple(self._obstacle_map.y_lim)
 
     def attach_reachability(self, hjr_fno) -> None:
         """Attach the HJR-FNO reachability oracle so step() can update its
@@ -151,10 +227,7 @@ class Navigation2DEnv:
         """
         self._robot_state[:2] = self._start_pos
         self._robot_state[2] = angle_normalize(
-            torch.atan2(
-                self._goal_pos[1] - self._start_pos[1],
-                self._goal_pos[0] - self._start_pos[0],
-            )
+            torch.tensor(self._start_theta, device=self._device, dtype=self._dtype)
         )
 
         self._fig = plt.figure(layout="tight")
@@ -200,6 +273,11 @@ class Navigation2DEnv:
                     o for o in self._unknown_obs if o not in detected_set
                 ]
 
+        # flag consumed by the guidance layer's replan trigger (see TopoGuidance.
+        # maybe_replan): the roadmap only needs rebuilding when the occupancy /
+        # reachable set actually changed.
+        self._obs_revealed = bool(detected)
+
         if detected:
             # newly seen obstacles move unknown -> known: rasterize into the
             # obstacle map (so the MPPI cost sees them) and report to the oracle.
@@ -211,7 +289,7 @@ class Navigation2DEnv:
                 self.hjr_fno.update_obs(detected)
 
         # goal check
-        goal_threshold = 0.5
+        goal_threshold = self.goal_threshold
         is_goal_reached = (
             torch.norm(self._robot_state[:2] - self._goal_pos) < goal_threshold
         )
@@ -367,17 +445,21 @@ class Navigation2DEnv:
             clip.write_gif(path, fps=10)
 
     def dynamics(
-        self, state: torch.Tensor, action: torch.Tensor, delta_t: float = 0.1
+        self, state: torch.Tensor, action: torch.Tensor, delta_t: float = None
     ) -> torch.Tensor:
         """
         Update robot state based on differential drive dynamics.
         Args:
             state (torch.Tensor): state batch tensor, shape (batch_size, 3) [x, y, theta]
             action (torch.Tensor): control batch tensor, shape (batch_size, 2) [v, omega]
-            delta_t (float): time step interval [s]
+            delta_t (float): time step interval [s]. None -> the shared control
+                period from eval/config.yaml (dt_c), which is the same value the
+                RRTX tracker integrates with.
         Returns:
             torch.Tensor: shape (batch_size, 3) [x, y, theta]
         """
+        if delta_t is None:
+            delta_t = self._dt_c
 
         # Perform calculations as before
         x = state[:, 0].view(-1, 1)
@@ -417,7 +499,14 @@ class Navigation2DEnv:
             torch.Tensor: shape (batch_size,)
         """
 
-        goal_cost = torch.norm(state[:, :2] - self._goal_pos, dim=1)
+        # Goal term: geodesic cost-to-go over the feasible corridor when a
+        # GeodesicCostToGo is attached (set by navigation2d in the guided
+        # pipeline); otherwise the plain straight-line distance (unchanged).
+        ctg = getattr(self, "cost_to_go", None)
+        if ctg is not None:
+            goal_cost = ctg.value_torch(state[:, :2])
+        else:
+            goal_cost = torch.norm(state[:, :2] - self._goal_pos, dim=1)
 
         pos_batch = state[:, :2].unsqueeze(1)  # (batch_size, 1, 2)
 
@@ -468,6 +557,29 @@ class Navigation2DEnv:
             safe = safe & feasible
 
         return safe
+
+    def points_feasible_xy(self, pts) -> np.ndarray:
+        """Heading-free reachable-set membership, for the topological PRM's grid
+        mask (TopoPRM.rasterize_feasible expects a plain (K,2) -> (K,) bool fn).
+
+        ``points_feasible`` only consumes ``thetas`` when the oracle's
+        feasibility_source is "HJR_sets"; with "feasible_region" (the
+        theta-marginalized set the blue overlay draws) it is heading-independent,
+        which is what a geometric roadmap needs. Passing thetas=None is therefore
+        exact, not an approximation, for that source.
+
+        Args:
+            pts: (K, 2) array-like of world xy points.
+        Returns:
+            np.ndarray: (K,) bool, True where the point is inside the set. All
+            True when no oracle is attached (collision-only roadmap).
+        """
+        pts = np.atleast_2d(np.asarray(pts, dtype=float))
+        if self.hjr_fno is None:
+            return np.ones(pts.shape[0], dtype=bool)
+        return np.asarray(
+            self.hjr_fno.points_feasible(pts, thetas=None), dtype=bool
+        ).reshape(-1)
 
     def collision_check(self, state: torch.Tensor) -> torch.Tensor:
         """

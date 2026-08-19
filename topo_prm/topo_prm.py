@@ -51,6 +51,7 @@ class TopoPRM:
         clearance: float = 0.5,
         resolution: float = 0.1,
         sample_inflate: Tuple[float, float] = (1.0, 6.0),
+        sample_mode: str = "ellipse",
         max_sample_num: int = 2000,
         max_sample_time: float = 2.0,
         max_raw_path: int = 200,
@@ -66,7 +67,15 @@ class TopoPRM:
             obstacle_map: ObstacleMap providing the numpy occupancy grid.
             clearance: min obstacle distance [m] for SAMPLED nodes (rejection).
             resolution: discretization step [m] for line-visibility / UVD.
-            sample_inflate: (along, perp) [m] padding of the start->goal ellipse.
+            sample_inflate: (along, perp) [m] padding of the start->goal ellipse
+                (only used when sample_mode="ellipse").
+            sample_mode: "ellipse" samples a rotated box around the start->goal
+                segment (Fast-Planner default; fast when the useful paths hug the
+                straight line). "domain" samples uniformly over the whole map
+                bounds -- needed when the feasible corridor requires a large
+                detour PERPENDICULAR to start->goal (e.g. a U-shaped reachable
+                set), which the ellipse never covers. "domain" needs a larger
+                max_sample_num for comparable density over the bigger region.
             max_sample_num / max_sample_time: sampling budget (count / seconds).
             max_raw_path: cap on enumerated raw paths (DFS).
             max_path_depth: cap on graph-path node count (DFS safety).
@@ -102,6 +111,12 @@ class TopoPRM:
         self.clearance = float(clearance)
         self.resolution = float(resolution)
         self.sample_inflate = np.asarray(sample_inflate, dtype=float)
+        self.sample_mode = str(sample_mode)
+        # map bounds [m] for "domain" sampling (fall back to grid extent)
+        self._xlim = list(getattr(obstacle_map, "x_lim",
+                                  [-0.5 * self.Nx * self.cell_size, 0.5 * self.Nx * self.cell_size]))
+        self._ylim = list(getattr(obstacle_map, "y_lim",
+                                  [-0.5 * self.Ny * self.cell_size, 0.5 * self.Ny * self.cell_size]))
         self.max_sample_num = int(max_sample_num)
         self.max_sample_time = float(max_sample_time)
         self.max_raw_path = int(max_raw_path)
@@ -111,6 +126,9 @@ class TopoPRM:
         self.short_cut_num = int(short_cut_num)
         self.feasible_fn = feasible_fn
         self._feas_grid: Optional[np.ndarray] = None  # set by rasterize_feasible
+        # world (x,y) cell centers to draw samples from in sample_mode="corridor"
+        # (e.g. the goal-reachable feasible cells of a geodesic cost-to-go).
+        self._sample_cells: Optional[np.ndarray] = None
         self._rng = np.random.default_rng(seed)
 
         # sampling frame (set per query in _setup_sampling)
@@ -226,11 +244,32 @@ class TopoPRM:
             [0.5 * dist + self.sample_inflate[0], self.sample_inflate[1]]
         )
 
+    def set_sample_cells(self, cells: Optional[np.ndarray]) -> None:
+        """Provide the world (x,y) cell centers for sample_mode="corridor"
+        (typically the goal-reachable feasible cells from a cost-to-go field).
+        Sampling then draws from these cells + sub-cell jitter, so essentially
+        every sample lands in the feasible corridor (no rejection waste)."""
+        self._sample_cells = None if cells is None else np.asarray(cells, dtype=float)
+
     def _sample_point(self) -> Optional[np.ndarray]:
-        """One uniform sample in the region; None if rejected (too close to an
-        obstacle / out of map)."""
-        r = self._rng.uniform(-1.0, 1.0, size=2) * self._sample_r
-        pt = self._translation + self._rotation @ r
+        """One uniform sample in the sampling region; None if rejected (too close
+        to an obstacle / outside the feasible set / out of map)."""
+        if (
+            self.sample_mode == "corridor"
+            and self._sample_cells is not None
+            and len(self._sample_cells)
+        ):
+            i = int(self._rng.integers(len(self._sample_cells)))
+            jitter = self._rng.uniform(-0.5, 0.5, size=2) * self.cell_size
+            pt = self._sample_cells[i] + jitter
+        elif self.sample_mode == "domain":
+            pt = np.array([
+                self._rng.uniform(self._xlim[0], self._xlim[1]),
+                self._rng.uniform(self._ylim[0], self._ylim[1]),
+            ])
+        else:  # "ellipse": rotated box around the start->goal segment
+            r = self._rng.uniform(-1.0, 1.0, size=2) * self._sample_r
+            pt = self._translation + self._rotation @ r
         if self._get_dist(pt[None, :])[0] <= self.clearance:
             return None
         if not self._feasible(pt[None, :])[0]:

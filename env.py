@@ -5,14 +5,23 @@ Environment for rrt_2D
 import numpy as np
 
 class Env:
-    def __init__(self, safe_regions=[]):
-        self.x_range = (-25, 25)
-        self.y_range = (-25, 25)
+    def __init__(self, safe_regions=[], unknown_obs=None, x_range=None, y_range=None):
+        """
+        unknown_obs / x_range / y_range: optional overrides so a shared evaluation
+            scenario (eval/scenarios.py) can define the world instead of the
+            hard-coded defaults below. All default to None -> original behaviour.
+        """
+        self.x_range = (-25, 25) if x_range is None else tuple(x_range)
+        self.y_range = (-25, 25) if y_range is None else tuple(y_range)
         self.safe_regions = safe_regions
         self.obs_boundary = self.obs_boundary()
         self.obs_circle = self.obs_circle()
         self.obs_rectangle = self.obs_rectangle()
-        self.unknown_obs_circle = self.unknown_obs_circle()
+        self.unknown_obs_circle = (
+            self.unknown_obs_circle()
+            if unknown_obs is None
+            else [list(o) for o in unknown_obs]
+        )
 
         filtered_obs = []
 
@@ -28,6 +37,20 @@ class Env:
 
             if not intersects:
                 filtered_obs.append([ox, oy, orad])
+
+        # A scenario-supplied list must survive this filter untouched, or RRTX and
+        # MPPI are not solving the same problem: MPPI's env does NOT filter, so
+        # anything dropped here exists for one planner and not the other. Random
+        # layouts satisfy R2 by construction (eval/scenarios.py) so they never
+        # trip it; the hand-authored ENV_C list is stored post-filter for the same
+        # reason. Warn rather than raise, so the built-in default map (which is
+        # meant to be filtered) still runs.
+        if unknown_obs is not None and len(filtered_obs) != len(self.unknown_obs_circle):
+            print(f"[env] WARNING: dropped "
+                  f"{len(self.unknown_obs_circle) - len(filtered_obs)} of "
+                  f"{len(self.unknown_obs_circle)} scenario obstacles for "
+                  f"overlapping a safe region -- MPPI does not filter, so the two "
+                  f"planners now see different maps.")
 
         self.unknown_obs_circle = filtered_obs
 

@@ -60,7 +60,21 @@ class Node(Sequence):
         self.x = n[0]
         self.y = n[1]
         self.parent = None
-        self.children = set([])
+        # children is keyed by the child's unique id, NOT stored in a set.
+        #
+        # __hash__ below is the node's POSITION and __eq__ also matches on equal cost
+        # keys, so a set cannot hold two distinct nodes that share a position -- and this
+        # planner creates those routinely (random_node returns Node((s_bot.x, s_bot.y)),
+        # saturate can land a sample exactly on an existing node, reset_robot_position
+        # inserts at the robot's exact spot). In a set, `add` was then a silent no-op and
+        # `remove` could evict the wrong twin, leaving `children` out of sync with the
+        # `parent` pointers. propagate_descendants discovers orphan descendants by walking
+        # `children`, so a missing entry meant a whole subtree was never marked
+        # unreachable: it kept a finite, self-consistent cost while its parent became an
+        # inf-cost evicted orphan. find_parent then preferred those cheap-looking
+        # "zombies" and the robot drove at a dead node. Measured: 89 desynced links and
+        # 211 / 1470 nodes with a finite lmc but no route to the root.
+        self.children = {}   # {child.id: child}
         self.cost_to_goal = cost_to_goal
         self.lmc = lmc
         self.infinite_dist_nodes = set([]) # set of nodes u where d_pi(v,u) has been set to infinity after adding an obstacle
@@ -69,6 +83,11 @@ class Node(Sequence):
         self.N_r_plus = set([]) # outgoing running in neighbours
         self.N_r_minus = set([]) # incoming running in neighbours
         self.active = False
+        # Is this node currently part of the graph (tree_nodes + kd_tree)?
+        # Maintained by RRTX.add_node / propagate_descendants. Needed because a
+        # membership test like `v in self.tree_nodes` is both O(n) and unsound:
+        # __eq__ below treats nodes with equal KEYS as equal.
+        self.in_tree = False
 
     def __eq__(self, other):
                 
@@ -102,23 +121,14 @@ class Node(Sequence):
         return self.N_o_minus.union(self.N_r_minus)
    
     def set_parent(self, new_parent):
-        # if a parent exists already
-        
-        if self.parent:
-            try:
-                self.parent.children.remove(self)
-            except:
-                print("")
-                # traceback.print_stack(limit=5)
-                # print('KeyError in set_parent()')
-                # print('Node', (self.x, self.y))
-                # print('cost', (self.cost_to_goal, self.lmc))
-                # print("Node's Parent", (self.parent.x, self.parent.y))
-                # for child in self.parent.children:
-                #     print("- children", (child.x, child.y))
-        
+        # Detach from the old parent and attach to the new one. Both operations are keyed
+        # by self.id, so they address THIS node and can never hit a position twin -- which
+        # is why the old set-based version needed a bare `except:` to hide its failures.
+        if self.parent is not None:
+            self.parent.children.pop(self.id, None)
+
         self.parent = new_parent
-        new_parent.children.add(self)
+        new_parent.children[self.id] = self
 
     def would_create_cycle(self, new_parent):
         """True if setting self.parent = new_parent would form a cycle (new_parent is self
@@ -169,9 +179,12 @@ class Node(Sequence):
         self.cull_neighbors(r)
         # candidates (u, d_pi(v,u)+lmc(u)) in increasing lmc order; take the first improving,
         # collision-free, acyclic one.
+        # `u.parent is not self` must be an IDENTITY test: `!=` runs __eq__, which also
+        # matches on equal cost keys, so an unrelated node sharing self's key would make a
+        # perfectly good candidate look like self's own child and get skipped.
         cands = sorted(
             ((u, self.distance(u) + u.lmc)
-             for u in (self.all_out_neighbors() - orphan_nodes) if u.parent and u.parent != self),
+             for u in (self.all_out_neighbors() - orphan_nodes) if u.parent and u.parent is not self),
             key=lambda x: x[1],
         )
         for p_prime, lmc_prime in cands:
@@ -198,7 +211,33 @@ class Node(Sequence):
         v.lmc = self.lmc
         return v
 
-    
+
+
+# ----------------------------------------------------------------------
+# Cost predicates -- the SINGLE definition of "is there a path from here".
+#
+# RRTx keeps two upper bounds on the cost-to-goal: cost_to_goal (g) and the lookahead
+# estimate lmc, with lmc <= g. lmc is written as soon as a parent is found
+# (find_parent), whereas g is only reconciled when the node is popped from the priority
+# queue -- and nothing pushes a freshly created node. So a node that was just connected
+# routinely has a finite lmc together with g = inf.
+#
+# Reading g in some places and lmc in others is what produced the spurious
+# "[WARNING] Robot is isolated" reports and the recovery loop that could never observe
+# its own success. Both classes in this module must use these two helpers rather than
+# touching either field directly.
+# ----------------------------------------------------------------------
+def path_cost(v):
+    """Best available upper bound on v's cost-to-goal; inf iff no route is known."""
+    if v is None:
+        return np.inf
+    return min(v.cost_to_goal, v.lmc)
+
+
+def has_path_to_goal(v):
+    """True iff a finite-cost route to the goal is known through v."""
+    return v is not None and math.isfinite(min(v.cost_to_goal, v.lmc))
+
 
 class RRTX:
     
@@ -263,6 +302,10 @@ class RRTX:
         sys.setrecursionlimit(3000) # for the kd-tree cus it searches recursively
         self.all_nodes_coor = []
         self.tree_nodes = [self.s_goal] # this is V_T in the paper
+        # The root is seeded into tree_nodes directly rather than via add_node, so mark it
+        # in-tree by hand -- otherwise _readmit_node sees the root as evicted (its lmc is
+        # 0.0, i.e. finite) and appends a SECOND copy to tree_nodes and the kd-tree.
+        self.s_goal.in_tree = True
         self.orphan_nodes = set([]) # this is V_T^C in the paper, i.e., nodes that have been disconnected from tree due to obstacles
         self.Q = [] # priority queue of ComparableNodes
         self.path_to_goal = np.array([False for _ in range(len(other_goals))])
@@ -272,6 +315,35 @@ class RRTX:
         self.robot_state = [0,0,0]
         # self.robot_position = [self.s_bot.x, self.s_bot.y]
         self.robot_speed = 0.6 # m/s
+        # Motion-execution parameters, deliberately matched to the MPPI side so the
+        # two planners run the SAME tracker with the SAME discretization:
+        #   motion_dt   == Navigation2DEnv.dynamics' delta_t
+        #   robot_w_max == env.u_max[1] (omega bound)
+        # See Utils.update_robot_position_dubins and the pure-pursuit tracker in
+        # mppi_src/guidance.py. One control step per planning_with_robot() cycle.
+        self.motion_dt = 0.1    # s
+        self.robot_w_max = 1.0  # rad/s
+
+        # ---- execution-time safety filter (see safe_pure_pursuit_step) --------
+        # RRTX certifies its EDGES at insertion time, but the pure-pursuit tracker
+        # drives an arc, not the edge, so the executed motion can leave the
+        # certified straight line (worst case ~2*v/w_max = 1.2 m, more than the
+        # 0.5 m obstacle inflation). This filter re-checks the motion the tracker
+        # is about to execute, and is the direct analogue of MPPI's RBR filter
+        # (constraint_func=env.points_safe under use_rbr).
+        self.exec_filter = True
+        self.filter_horizon = 15          # steps of pure pursuit to look ahead
+        # speeds to try, largest first; 0.0 = rotate in place (unicycle, v may be 0)
+        self.filter_speed_scales = (1.0, 0.5, 0.25, 0.0)
+        # diagnostics: how the filter resolved each control step
+        self.filter_counts = {"nominal": 0, "slowed": 0, "rotate": 0, "blocked": 0}
+        # A purely reactive filter can deadlock: if the pursued waypoint is itself
+        # unreachable the robot rotates in place forever. Escalate to the
+        # contingency behaviour after this many consecutive zero-progress steps
+        # (50 steps x 0.1 s = 5 s) instead of stalling silently.
+        self.filter_stall_limit = 50
+        self._filter_stall = 0
+
         self.lidar_range = lidar_range
         self.utils.sensing_radius = lidar_range
         
@@ -378,12 +450,12 @@ class RRTX:
                     self.reduce_inconsistency(robots_plan=robots_plan)
 
             
-            if robots_plan and self.s_bot.cost_to_goal < np.inf:
+            if robots_plan and self.has_path_to_goal(self.s_bot):
                 self.robot_path_to_goal = True
             
             
             for j, goal_j in enumerate(self.other_goals):
-                if goal_j.cost_to_goal < np.inf:
+                if self.has_path_to_goal(goal_j):
                     self.path_to_goal[j] = True
                     
     def reset_robot_position(self, new_position: Tuple[float, float], heading: float = None):
@@ -400,18 +472,44 @@ class RRTX:
 
         SNAP_THRESHOLD = 0.5
 
-        if dist < SNAP_THRESHOLD and nearest.lmc < np.inf:
+        # `nearest.in_tree` matters: an orphan that lingers in the kd-tree would otherwise
+        # be offered here, fail the lmc test, and push every reset down the wire/pending
+        # branch -- which creates yet another node at the robot's exact position. Piles of
+        # position twins are what made the __eq__-based container operations misfire in the
+        # first place, so refuse evicted nodes explicitly rather than relying on their
+        # infinite lmc to disqualify them.
+        if dist < SNAP_THRESHOLD and nearest.in_tree and nearest.lmc < np.inf:
             # Reuse an existing well-connected node
             self.s_bot = nearest
             self._pending_reset_target = None
 
-        else:
-            # Saturate so it's within step_len of nearest
-            new_node = self.saturate(nearest, new_node)
+            # The reused node is very likely INCONSISTENT: extend()/find_parent() give a
+            # new node its lmc but leave cost_to_goal at the inf default, and nothing
+            # queues it, so reduce_inconsistency never reconciles the two unless the node
+            # happens to be popped for some other reason. Snapping onto such a node hands
+            # the robot lmc < inf together with cost_to_goal = inf -- and every consumer
+            # reads cost_to_goal (the ATSP matrix, the isolation check), so a perfectly
+            # connected robot is reported as having no path to any goal.
+            if self.s_bot.cost_to_goal != self.s_bot.lmc:
+                self.verify_queue(self.s_bot)
+                self.reduce_inconsistency(robots_plan=True)
 
-            V_near = self.near(new_node)
-            if not V_near:
-                V_near = [nearest]
+        else:
+            # Wire a node in AT THE ROBOT'S TRUE POSITION -- deliberately NOT saturated.
+            # saturate() returns a point one step_len from `nearest` along the direction
+            # of the robot, i.e. NOT where the robot is; Step 2 below then overwrote
+            # robot_state with that node's coordinates, teleporting the robot by
+            # dist(robot, nearest) - step_len metres. That is how a robot at
+            # (-11.00, 10.07) ended up reported at (-13.83, 4.53) right after an
+            # obstacle update pruned the nodes near it.
+            #
+            # For the same reason the old `if not V_near: V_near = [nearest]` fallback is
+            # gone: it accepted a parent at ANY distance, so the robot node could be
+            # attached by an edge far longer than step_len. If nothing is close enough we
+            # go pending instead, and random_node()/_try_connect_pending grow the tree
+            # toward the robot in step_len increments until a real connection exists.
+            V_near = [u for u in self.near(new_node)
+                      if math.hypot(u.x - new_node.x, u.y - new_node.y) <= self.step_len]
 
             V_near_free = [u for u in V_near if not self.utils.is_collision(u, new_node)]
 
@@ -429,6 +527,16 @@ class RRTX:
                                     heading if heading is not None else self.robot_state[2]]
                 self.robot_path_to_goal = False
                 self.path = []
+
+                # s_bot still points at the node for the PREVIOUS position, so its cost
+                # describes a route from somewhere the robot no longer is -- and callers
+                # read that cost (isolation checks, the ATSP matrix). Orphan it here so
+                # every caller gets the same well-defined state (inf cost + a pending
+                # target) instead of each one having to remember to do this itself, as
+                # the planning loop currently does in one place and not the others.
+                if self.s_bot is not None and self.s_bot.parent is not None:
+                    self.verify_orphan(self.s_bot)
+                    self.propagate_descendants(robots_plan=True)
                 return False
 
             # Has collision-free neighbors — wire into tree normally
@@ -447,15 +555,26 @@ class RRTX:
                 u.N_r_plus.add(new_node)
                 u.N_r_minus.add(new_node)
 
-            self.rewire_neighbours(new_node)
-            self.reduce_inconsistency()
 
             self.s_bot = new_node
             self._pending_reset_target = None
+            self.rewire_neighbours(new_node, robots_plan=True)
+            self.verify_queue(self.s_bot)              # <-- the robot node itself must be in Q
+            self.reduce_inconsistency(robots_plan=True)
+
+            # self.rewire_neighbours(new_node)
+            # self.reduce_inconsistency()
+
+            # self.s_bot = new_node
+            # self._pending_reset_target = None
 
         # --- Step 2: Update robot state ---
-        self.robot_position = [self.s_bot.x, self.s_bot.y]
-        self.robot_state = [self.s_bot.x, self.s_bot.y,
+        # The robot's state is the position it was RESET TO, never s_bot's coordinates.
+        # s_bot is only the graph anchor: in the snap branch it may sit up to
+        # SNAP_THRESHOLD away, which is the same small lag the executor already tolerates
+        # (planning_with_robot advances s_bot to its parent once the robot is within 0.5 m).
+        self.robot_position = [new_position[0], new_position[1]]
+        self.robot_state = [new_position[0], new_position[1],
                             heading if heading is not None else self.robot_state[2]]
 
         self.robot_path_to_goal = self.s_bot.lmc < np.inf
@@ -528,7 +647,7 @@ class RRTX:
         if self.s_bot.lmc < np.inf:
             self.verify_queue(self.s_bot)
             
-        if self.s_bot.cost_to_goal < np.inf:
+        if self.has_path_to_goal(self.s_bot):
             self.robot_path_to_goal = True
             self.update_path(self.s_bot)
             
@@ -570,7 +689,7 @@ class RRTX:
                         self.rewire_neighbours(v, robots_plan=True)
                         self.reduce_inconsistency(robots_plan=True)
                         
-                if self.s_bot.cost_to_goal < np.inf:
+                if self.has_path_to_goal(self.s_bot):
                     self.robot_path_to_goal = True
                     self.update_path(self.s_bot)
                     
@@ -673,11 +792,13 @@ class RRTX:
                                                 self.robot_position[1]))
                 self._try_connect_pending()
                     
-            if self.s_bot.cost_to_goal == np.inf:
+            if not self.has_path_to_goal(self.s_bot):
                 self.robot_path_to_goal = False
-                
-                if self.s_bot.lmc < np.inf:
-                    self.verify_queue(self.s_bot)
+            elif self.s_bot.cost_to_goal != self.s_bot.lmc:
+                # finite lmc but a stale g: connected, just not reconciled yet -> queue it
+                # rather than declaring the robot path-less (that mislabel is what the
+                # isolation checks used to trip on).
+                self.verify_queue(self.s_bot)
                 # print("======== Robot has infinite cost ========")
                 # print(self.s_bot.cost_to_goal)
                 # print(self.s_bot.lmc)
@@ -694,43 +815,88 @@ class RRTX:
                 #Terminate when reach the goal
                 if self.s_bot.cost_to_goal == 0.0 and self.s_bot.lmc == 0.:
                     return all_new_obs, new_obs_flag, traversed_distance
-                
-                # Update robot position            
-                self.robot_state = self.utils.update_robot_position_dubins(self.robot_state, [self.s_bot.parent.x, self.s_bot.parent.y], 0.01, v=self.robot_speed)
-                self.robot_position = self.robot_state[:2]
-                
-                # Lidar radial detection of the obstacles
-                self.unknown_obs_circle, detected_obs = self.utils.lidar_detected(self.robot_position)
-                # NOTE self.unknown_obs_circle == self.env.unknown_obs_circle == self.utils.unknown_obs_circle
-                # self.plotting.unknwown_obs_circle must be updated independently >>> implement this in RRTX.update_obstacles()
-                
-                if len(detected_obs) > 0:
+            
+                # RRTX Tree expands for 10 steps (for exploration)
+                # Robot itself actually only moves the very last iteration
+                if step_idx == steps - 1:
                     
-                    #sharing new obstacles found with other RRTX-tree in TSP loop
-                    all_new_obs += detected_obs
-                    new_obs_flag = True
+                    # Update robot position: pure-pursuit step toward the next waypoint
+                    # NOTE velocity is tapered so it cannot overshoot the tree's goal.
+                    target = [self.s_bot.parent.x, self.s_bot.parent.y]
+
+
+                    # TODO I remove the safety filter for applying control for now
+                    if False: #self.exec_filter:
+                        # Re-check what the tracker is about to DO (not just the edge
+                        # the planner certified) and back off if it is inadmissible.
+                        next_state, tag = self.safe_pure_pursuit_step(target)
+                        if next_state is None:
+                            # Even standing still is inadmissible -> the current state
+                            # is already outside the feasible set (the reachable set
+                            # shrank under the robot). Hold and escalate.
+                            print("[exec-filter] BLOCKED: current state inadmissible "
+                                  f"at {np.round(self.robot_position, 2)}"
+                                  + (" -> contingency" if self.HJ_contingency_enable else ""))
+                            if self.HJ_contingency_enable:
+                                self.contingency_triggered = True
+                        else:
+                            if tag != "nominal":
+                                print(f"[exec-filter] {tag}: backing off at "
+                                      f"{np.round(self.robot_position, 2)}")
+                            self.robot_state = next_state
+
+                        # A reactive filter can rotate in place forever if the
+                        # pursued waypoint is itself unreachable. Escalate instead
+                        # of stalling silently.
+                        if self.filter_stalled():
+                            print(f"[exec-filter] STALLED for {self._filter_stall} steps "
+                                  "(no progress) -> contingency")
+                            self._filter_stall = 0
+                            if self.HJ_contingency_enable:
+                                self.contingency_triggered = True
+                    else:
+                        self.robot_state = self.utils.update_robot_position_dubins(
+                            self.robot_state,
+                            target,
+                            self.motion_dt,
+                            v=self.robot_speed,
+                            w_max=self.robot_w_max,
+                            stop_at=(self.s_goal.x, self.s_goal.y),
+                        )
+                    self.robot_position = self.robot_state[:2]
+                
+                    # Lidar radial detection of the obstacles
+                    self.unknown_obs_circle, detected_obs = self.utils.lidar_detected(self.robot_position)
+                    # NOTE self.unknown_obs_circle == self.env.unknown_obs_circle == self.utils.unknown_obs_circle
+                    # self.plotting.unknwown_obs_circle must be updated independently >>> implement this in RRTX.update_obstacles()
+                
+                    if len(detected_obs) > 0:
+                    
+                        #sharing new obstacles found with other RRTX-tree in TSP loop
+                        all_new_obs += detected_obs
+                        new_obs_flag = True
 
                     
-                    print(f"\n ----- Rewiring Trees {self.goal_id} due to {len(detected_obs)} newly-detected obstacle(s) ----- ")
-                    print("Obstacle location: ", detected_obs)
+                        print(f"\n ----- Rewiring Trees {self.goal_id} due to {len(detected_obs)} newly-detected obstacle(s) ----- ")
+                        print("Obstacle location: ", detected_obs)
                     
-                    # TODO update HJB reachable set with the detected_obs here
-                    exec_time_start = time.time()
+                        # TODO update HJB reachable set with the detected_obs here
+                        exec_time_start = time.time()
                     
-                    if self.HJ_contingency_enable:
-                        self.hjr_fno.update_obs(detected_obs)
-                        print("Update Reachable set:", time.time() - exec_time_start, "s")
+                        if self.HJ_contingency_enable:
+                            self.hjr_fno.update_obs(detected_obs)
+                            print("Update Reachable set:", time.time() - exec_time_start, "s")
                     
-                    # update known obstacles within the environment (all at once: one tree-repair)
-                    self.update_obstacles(detected_obs, robots_plan=True, print_time=True)
+                        # update known obstacles within the environment (all at once: one tree-repair)
+                        self.update_obstacles(detected_obs, robots_plan=True, print_time=True)
                 
-                # update node that robot is currently at
-                if self.s_bot.parent is not None:
-                    if math.hypot(self.robot_position[0] - self.s_bot.parent.x,
-                                self.robot_position[1] - self.s_bot.parent.y) < 0.5:
+                    # update node that robot is currently at
+                    if self.s_bot.parent is not None:
+                        if math.hypot(self.robot_position[0] - self.s_bot.parent.x,
+                                    self.robot_position[1] - self.s_bot.parent.y) < 0.5:
                         
-                        traversed_distance += self.s_bot.distance(self.s_bot.parent)
-                        self.s_bot = self.s_bot.parent
+                            traversed_distance += self.s_bot.distance(self.s_bot.parent)
+                            self.s_bot = self.s_bot.parent
                         
             ''' Expand the tree for more optimal path'''            
             self.search_radius = self.shrinking_ball_radius()
@@ -767,11 +933,11 @@ class RRTX:
                     self.reduce_inconsistency(robots_plan=True)
 
             
-            if self.s_bot.cost_to_goal < np.inf:
+            if self.has_path_to_goal(self.s_bot):
                 self.robot_path_to_goal = True
                 
             for j, goal_j in enumerate(self.other_goals):
-                if goal_j.cost_to_goal < np.inf:
+                if self.has_path_to_goal(goal_j):
                     self.path_to_goal[j] = True
                     
             # Allow matplotlib to process events (including mouse clicks)
@@ -963,9 +1129,7 @@ class RRTX:
     def verify_orphan(self, v):
         # Algorithm 10
         # if v is in Q, remove it from Q and add it to orphan_nodes
-        key = self.node_in_queue(v)
-        if key is not None:
-            self.Q.remove((key, v))
+        self._pop_from_queue(v)   # identity-matched; see _pop_from_queue
         self.orphan_nodes.add(v)
 
     def propagate_descendants(self, robots_plan=False):
@@ -977,13 +1141,30 @@ class RRTX:
         # Algorithm 9
         if not self.orphan_nodes:
             return
-        # recursively add children of nodes in orphan_nodes to orphan_nodes using BFS
+        # Recursively add the descendants of every orphan, via BFS.
+        #
+        # The child index is rebuilt here from the `parent` pointers rather than read off
+        # each node's own `children` record. Parent pointers are what the route actually
+        # follows (update_path walks them), so they are authoritative; deriving the index
+        # from them means a desynced `children` record cannot hide a descendant and leave
+        # it advertising a finite cost with no route to the goal. One O(len(tree_nodes))
+        # pass, negligible beside the FNO feasibility queries.
+        kids = {}
+        for nd in self.tree_nodes:
+            if nd.parent is not None:
+                kids.setdefault(nd.parent.id, []).append(nd)
+
         orphan_queue = deque(list(self.orphan_nodes))
+        visited = {nd.id for nd in self.orphan_nodes}
         while orphan_queue:
             node = orphan_queue.pop()
-            for child in node.children:
-                orphan_queue.append(child)
-                self.orphan_nodes.add(child)
+            for child in kids.get(node.id, ()):
+                # `visited` also stops a node being re-queued via several routes, which the
+                # previous version did unboundedly.
+                if child.id not in visited:
+                    visited.add(child.id)
+                    orphan_queue.append(child)
+                    self.orphan_nodes.add(child)
 
         
         # put all outgoing neighbours of orphan nodes in Q and tell them to rewire
@@ -1001,27 +1182,69 @@ class RRTX:
             if v.parent:
                 v.infinite_dist_nodes.add(v.parent)
                 v.parent.infinite_dist_nodes.add(v)
-                v.parent.children.remove(v)
+                v.parent.children.pop(v.id, None)   # identity-keyed; see Node.set_parent
                 v.parent = None
+            v.in_tree = False
 
-            try:
-                self.tree_nodes.remove(v) # NOT IN THE PSEUDOCODE
-                self.kd_tree.remove(v)
-                
-            except ValueError:
-                pass
-            
+        # ---- Evict the orphans from the graph, BY IDENTITY ----------------------
+        # The previous version did `self.tree_nodes.remove(v)` then `self.kd_tree.remove(v)`
+        # inside one try/except, which was wrong twice over:
+        #
+        #  * list.remove() compares with __eq__, which matches on position OR cost key, so
+        #    it could delete a perfectly healthy twin instead of the orphan. That node then
+        #    vanished from tree_nodes while still flagged in_tree, so the `kids` index above
+        #    never saw it and its subtree was never marked unreachable -- leaving branches
+        #    advertising a finite cost with no route to the root (measured: 225 / 1484).
+        #  * kdtree.remove(point) matches by POSITION and, per its own docstring, removes
+        #    "one of" the matches unless the internal KDNode is passed for identity. So the
+        #    real orphan often stayed in the kd-tree, where nearest() kept returning it;
+        #    its lmc is inf, so the snap test in reset_robot_position failed and yet another
+        #    duplicate node was created at the same spot -- a self-reinforcing pile-up.
+        #  * a ValueError from the first call also skipped the second entirely.
+        #
+        # Rebuilding the list against a set of ids is O(len(tree_nodes)) once, instead of
+        # O(len(tree_nodes)) interpreted __eq__ calls PER orphan: ~0.1 ms in place of the
+        # ~85-150 ms that dominated this method (median 0.64 s per call in profiling).
+        orphan_ids = {v.id for v in self.orphan_nodes}
+        self.tree_nodes = [nd for nd in self.tree_nodes if nd.id not in orphan_ids]
+
+        # Rebuild the kd-tree from the surviving nodes instead of deleting from it.
+        #
+        # Per-node deletion cannot be done safely here. kdtree.remove() matches by POSITION,
+        # and with several nodes on one point a single call detached ALL of them from the
+        # tree (verified: removing 1 of 3 twins left 0 of 3 reachable). Passing the internal
+        # KDNode makes the match identity-checked, but then _remove() -> extreme_child()
+        # recurses to the tree's depth -- and since add() never rebalances, that depth grows
+        # until Python's recursion limit is hit (observed as a RecursionError).
+        #
+        # kdtree.create() sidesteps both problems and returns a BALANCED tree (depth 11 for
+        # 1500 nodes, versus the degenerate chain that overflowed), which speeds up every
+        # later near()/nearest() query. Measured at ~6.6 ms per rebuild for 1500 nodes,
+        # against the ~85-150 ms this method used to burn in list.remove alone.
+        self.kd_tree = kdtree.create(self.tree_nodes)
+
         # check if robot node got orphaned
         if robots_plan:
-            if self.s_bot in self.orphan_nodes or np.isinf(self.s_bot.cost_to_goal):
+            if any(o is self.s_bot for o in self.orphan_nodes) or not self.has_path_to_goal(self.s_bot):
                 print('robot node got orphaned')
                 self.robot_path_to_goal = False
                 self.path = []
+
+                # Arm the reconnect machinery. Orphaning strips s_bot of its parent AND
+                # evicts it from tree_nodes/kd_tree, so nothing can re-attach it: the
+                # sampling bias in random_node and _try_connect_pending both key off
+                # _pending_reset_target, which used to be left as None here. The robot
+                # then stayed isolated until some unrelated caller happened to invoke
+                # reset_robot_position -- which is what made the planner sit idle in a
+                # safe set after a contingency.
+                self._pending_reset_target = Node((self.robot_position[0],
+                                                  self.robot_position[1]))
+                self._pending_reset_heading = self.robot_state[2]
         
         # else:
         #Check if path between goal got orphaned
         for j, goal_j in enumerate(self.other_goals):
-            if goal_j in self.orphan_nodes or np.isinf(goal_j.cost_to_goal):
+            if any(o is goal_j for o in self.orphan_nodes) or not self.has_path_to_goal(goal_j):
                 self.path_to_goal[j] = False
                 self.multi_paths[j] = []
                 self.multi_path_nodes[j] = []
@@ -1032,10 +1255,8 @@ class RRTX:
         # Algorithm 13
         # this does not do the updating, it is done after all changes are made (in propagate_descendants)
         # if v is in Q, update its cost and position, otherwise just add it
-        key = self.node_in_queue(v)
-        # if v is already in Q, remove it first before adding it with updated cost
-        if key is not None:
-            self.Q.remove((key, v))
+        # (identity-matched removal so a key-twin is not evicted: see _pop_from_queue)
+        self._pop_from_queue(v)
         heapq.heappush(self.Q, (v.get_key(), v))
 
     def reduce_inconsistency(self, robots_plan=False):
@@ -1090,11 +1311,22 @@ class RRTX:
             except TypeError:
                 print('something went wrong with the queue')
         
-            if v.cost_to_goal - v.lmc > self.epsilon:
+            # NOTE `v.cost_to_goal - v.lmc` is nan when BOTH are inf -- precisely the state
+            # propagate_descendants leaves every orphan in. Under a bare `> epsilon` test
+            # that comparison is False, so update_LMC never runs, the orphan never searches
+            # its neighbours for a new parent, and the assignment below re-stamps it inf
+            # forever. update_obstacles queues the robot node and calls this method
+            # expecting exactly that recovery, so an orphaned robot could never self-heal.
+            # An infinite lmc is inconsistent by definition -- treat it as such.
+            if np.isinf(v.lmc) or v.cost_to_goal - v.lmc > self.epsilon:
                 v.update_LMC(self.orphan_nodes, self.search_radius, self.epsilon, self.utils)
                 self.rewire_neighbours(v, robots_plan=robots_plan) #find better paths through v
 
             v.cost_to_goal = v.lmc
+
+            # If v just regained a finite cost it may be an orphan that was evicted from
+            # the graph; without this it stays invisible to near()/nearest() forever.
+            self._readmit_node(v)
 
         # Tree is now consistent — safe to recompute paths (no transient parent cycles).
         self.refresh_paths(robots_plan=robots_plan)
@@ -1109,6 +1341,7 @@ class RRTX:
     def add_node(self, node_new, robots_plan=False):
         self.all_nodes_coor.append(np.array([node_new.x, node_new.y])) # for plotting
         self.tree_nodes.append(node_new)
+        node_new.in_tree = True
         
         #update priority queue with distance to other target locations
         # node_new.active = True
@@ -1121,9 +1354,18 @@ class RRTX:
         # if new node is at start, then path to goal is found
         if robots_plan:
             
-            if node_new == self.s_bot:
+            # Compare POSITIONS, not `node_new == self.s_bot`: Node.__eq__ also matches on
+            # equal cost keys, and get_key() is (min(cost_to_goal, lmc), cost_to_goal), so an
+            # orphaned s_bot keyed (inf, inf) compares equal to EVERY new node whose lmc is
+            # also inf -- silently re-pointing s_bot at an unrelated node metres away with no
+            # parent and infinite cost, which strands the robot.
+            if self.s_bot is not None and \
+                    math.hypot(node_new.x - self.s_bot.x, node_new.y - self.s_bot.y) < 1e-6:
                 self.s_bot = node_new
-                self.robot_path_to_goal = True
+                # Re-attaching the robot node does NOT by itself prove a route exists --
+                # find_parent only set lmc, and the parent chain may still be rooted in an
+                # inf-cost subtree. Ask the predicate instead of asserting True blindly.
+                self.robot_path_to_goal = self.has_path_to_goal(self.s_bot)
                 self.update_path(self.s_bot) # update path to goal for plotting
                 
                 # self.other_goals[self.curr_tree_idx] = self.s_bot
@@ -1133,7 +1375,10 @@ class RRTX:
         # else:
             
         for j in range(len(self.other_goals)):
-            if node_new == self.other_goals[j]:
+            # Position test for the same reason as above: an unreached goal is also keyed
+            # (inf, inf), so `==` let any inf-lmc node replace the goal object outright.
+            goal_j = self.other_goals[j]
+            if math.hypot(node_new.x - goal_j.x, node_new.y - goal_j.y) < 1e-6:
                 self.other_goals[j] = node_new
                 self.path_to_goal[j] = True
                 self.update_multi_paths(node_new, j)
@@ -1161,7 +1406,7 @@ class RRTX:
         best_u = U[min_idx]
         if not self.utils.is_collision(best_u, v):
             v.set_parent(best_u)
-            v.lmc = costs[min_idx] + best_u.lmc
+            v.lmc = costs[min_idx] #+ best_u.lmc NOTE u.lmc is already included in 'costs' array
         else:
             del U[min_idx]
             self.find_parent(v, U)
@@ -1171,7 +1416,8 @@ class RRTX:
         #NOTE remove is_feasible_ray in rewire_neighbor
         
         # Algorithm 4
-        if v.cost_to_goal - v.lmc > self.epsilon:
+        # inf/inf -> nan under a bare `> epsilon` test; see reduce_inconsistency.
+        if np.isinf(v.lmc) or v.cost_to_goal - v.lmc > self.epsilon:
             v.cull_neighbors(self.search_radius)
             for u in v.all_in_neighbors() - set([v.parent]):
                 if u.lmc > v.distance(u) + v.lmc and \
@@ -1237,42 +1483,55 @@ class RRTX:
         Attempts to wire the target into the tree now that more nodes may exist nearby.
         On success, sets s_bot and clears the pending target.
         """
-        # Always use current robot position
+        # Always use current robot position. The node is placed AT that position and is
+        # deliberately NOT saturated: a saturated node sits step_len from `nearest`
+        # rather than at the robot, and the assignments at the end of this method would
+        # then rewrite robot_state with it -- a silent teleport (same defect as
+        # reset_robot_position). Neighbours are likewise capped at step_len instead of
+        # falling back to `nearest` at any distance; if nothing is close enough we stay
+        # pending and keep growing the tree toward the robot.
         target = Node((self.robot_position[0], self.robot_position[1]))
-        nearest = self.nearest(target)
-        saturated = self.saturate(nearest, target)
 
-        V_near = self.near(saturated)
-        if not V_near:
-            V_near = [nearest]
+        V_near = [u for u in self.near(target)
+                  if math.hypot(u.x - target.x, u.y - target.y) <= self.step_len]
 
-        V_near_free = [u for u in V_near if not self.utils.is_collision(u, saturated)]
+        V_near_free = [u for u in V_near if not self.utils.is_collision(u, target)]
         if not V_near_free:
             return  # still blocked, keep biasing
 
-        self.find_parent(saturated, V_near_free)
-        if saturated.parent is None:
+        self.find_parent(target, V_near_free)
+        if target.parent is None:
             return
 
-        self.add_node(saturated)
+        self.add_node(target)
 
         for u in V_near_free:
-            saturated.N_o_plus.add(u)
-            saturated.N_o_minus.add(u)
-            u.N_r_plus.add(saturated)
-            u.N_r_minus.add(saturated)
+            target.N_o_plus.add(u)
+            target.N_o_minus.add(u)
+            u.N_r_plus.add(target)
+            u.N_r_minus.add(target)
 
-        self.rewire_neighbours(saturated)
-        self.reduce_inconsistency()
-
-        self.s_bot = saturated
+        # Assign s_bot BEFORE the queue work: reduce_inconsistency's loop condition and
+        # refresh_paths only consider the robot node when robots_plan=True, and
+        # find_parent/add_node set lmc while leaving cost_to_goal at its inf default
+        # (rewire_neighbours queues in-neighbours, never `target` itself). Without the
+        # verify_queue below, a robot reconnected through THIS path keeps
+        # cost_to_goal = inf -- and since the reconnect machinery routes most resets
+        # here, that is the dominant source of "isolated" reports for a robot that is
+        # demonstrably attached to the tree.
+        self.s_bot = target
         self._pending_reset_target = None
 
+        self.rewire_neighbours(target, robots_plan=True)
+        self.verify_queue(self.s_bot)
+        self.reduce_inconsistency(robots_plan=True)
+
+        # s_bot is AT the robot, so this only fills in the heading.
         heading = self._pending_reset_heading
         self.robot_state = [self.s_bot.x, self.s_bot.y,
                             heading if heading is not None else self.robot_state[2]]
         self.robot_position = [self.s_bot.x, self.s_bot.y]
-        self.robot_path_to_goal = self.s_bot.lmc < np.inf
+        self.robot_path_to_goal = self.has_path_to_goal(self.s_bot)
         self.update_path(self.s_bot)
 
         print(f"[_try_connect_pending] Pending target connected at "
@@ -1340,16 +1599,53 @@ class RRTX:
             self.multi_paths[idx].append(np.array([[node.x, node.y], [node.parent.x, node.parent.y]]))
             node = node.parent
     
+    # Thin aliases so `self.has_path_to_goal(...)` reads naturally inside the tree code;
+    # the definitions live at module level (see path_cost / has_path_to_goal).
+    path_cost = staticmethod(path_cost)
+    has_path_to_goal = staticmethod(has_path_to_goal)
+
     def node_in_queue(self, node):
-        if not self.Q:
-            return None
-        keys, nodes = list(zip(*self.Q))
-        try:
-            idx = nodes.index(node)
-            return keys[idx]
-        except ValueError:
-            return None
-        
+        """Key of `node`'s own entry in Q, or None. Identity-matched -- see
+        _pop_from_queue for why value equality must not be used here."""
+        for key, n in self.Q:
+            if n is node:
+                return key
+        return None
+
+    def _pop_from_queue(self, node):
+        """Remove `node`'s OWN entry from Q (matched by identity) and return its key.
+
+        Node.__eq__ reports equality when two nodes merely share a KEY
+        (`self.get_key() == other.get_key()`), and get_key() is
+        (min(cost_to_goal, lmc), cost_to_goal). After propagate_descendants every
+        orphan shares the key (inf, inf), so the previous `nodes.index(node)` +
+        `self.Q.remove((key, node))` pair matched whichever unrelated node sat first in
+        Q and silently evicted THAT one instead. The evicted node's pending cost update
+        was then lost forever, leaving it at cost_to_goal = inf.
+
+        list.remove also breaks the heap invariant, so re-heapify before returning.
+        """
+        for i, (key, n) in enumerate(self.Q):
+            if n is node:
+                self.Q.pop(i)
+                heapq.heapify(self.Q)
+                return key
+        return None
+
+    def _readmit_node(self, v):
+        """Put a node that recovered a finite cost back into the graph.
+
+        propagate_descendants evicts orphans from tree_nodes AND kd_tree. If such a
+        node later regains a parent, it is still invisible to near()/nearest(), so no
+        future rewiring can maintain it -- it silently rots outside the tree.
+        """
+        if v.in_tree or not math.isfinite(v.lmc):
+            return
+        v.in_tree = True
+        self.tree_nodes.append(v)
+        self.kd_tree.add(v)
+
+
     def is_feasible_ray(self, start:Node, end:Node):
         
         o, d = self.utils.get_ray(start, end)
@@ -1386,6 +1682,95 @@ class RRTX:
         return bool(np.all(self.hjr_fno.points_feasible(
             positions, thetas=thetas, reachable_set_constraint=self.HJ_contingency_enable)))
 
+    # ------------------------------------------------------------------
+    # execution-time safety filter
+    # ------------------------------------------------------------------
+    def _poses_admissible(self, poses) -> bool:
+        """Are ALL of these poses admissible? Obstacle-clear against the KNOWN
+        obstacles inflated by utils.delta (same rule as Utils.is_inside_obs) AND,
+        when the contingency constraint is on, inside the HJ reachable set.
+
+        One batched points_feasible call for the whole set -- that call has a fixed
+        overhead that dominates its per-point cost, so checking 15 poses costs
+        essentially the same as checking 1."""
+        poses = np.atleast_2d(np.asarray(poses, dtype=float))
+        pts = poses[:, :2]
+
+        if self.obs_circle:
+            obs = np.asarray(self.obs_circle, dtype=float)          # (M, 3)
+            d2 = ((pts[:, None, 0] - obs[None, :, 0]) ** 2
+                  + (pts[:, None, 1] - obs[None, :, 1]) ** 2)
+            if np.any(d2 <= (obs[None, :, 2] + self.utils.delta) ** 2):
+                return False
+
+        if not self.HJ_contingency_enable:
+            return True
+
+        # B1: theta is only consumed by the theta-dependent "HJR_sets" source
+        thetas = poses[:, 2] if self.hjr_fno.feasibility_source == "HJR_sets" else None
+        return bool(np.all(self.hjr_fno.points_feasible(
+            pts, thetas=thetas, reachable_set_constraint=True)))
+
+    def _pursuit_rollout(self, state, target, n_steps, v):
+        """Predict `n_steps` of pure pursuit toward a FIXED `target` at speed `v`.
+
+        The target is held fixed over the rollout; the real tracker re-targets every
+        step (the waypoint advances), so this is an approximation -- but a
+        conservative one for the purpose it serves: holding the target makes the
+        predicted turn tighter and the predicted path hug the current heading error,
+        so a rollout that passes is not optimistic about the near term. Only the
+        FIRST pose is ever executed; the rest is early warning.
+        """
+        poses = np.empty((n_steps, 3), dtype=float)
+        s = list(state)
+        for k in range(n_steps):
+            s = self.utils.update_robot_position_dubins(
+                s, target, self.motion_dt, v=v, w_max=self.robot_w_max,
+                stop_at=(self.s_goal.x, self.s_goal.y),
+            )
+            poses[k] = s
+        return poses
+
+    def safe_pure_pursuit_step(self, target):
+        """One control step of pure pursuit toward `target`, filtered for safety.
+
+        Tries progressively gentler commands and executes the FIRST whose predicted
+        `filter_horizon`-step rollout is entirely admissible:
+
+            v = robot_speed  ->  0.5*  ->  0.25*  ->  0 (rotate in place)
+
+        Slowing down helps for two reasons: the step is shorter (less distance into
+        whatever lies ahead) and, since rho = v/w_max shrinks, the turn is tighter,
+        so the robot can round a corner it would otherwise overshoot. v = 0 keeps
+        turning while standing still, which is admissible for a unicycle (env
+        u_min[0] = 0) and is how the robot recovers from a large heading error.
+
+        @return (next_state, tag) with tag in {"nominal", "slowed", "rotate"}, or
+                (None, "blocked") when even standing still is inadmissible -- which
+                means the CURRENT state is already infeasible (the reachable set
+                shrank under the robot after a lidar reveal). The caller should hold
+                position and escalate to the contingency behaviour.
+        """
+        for scale in self.filter_speed_scales:
+            poses = self._pursuit_rollout(
+                self.robot_state, target, self.filter_horizon, self.robot_speed * scale)
+            if self._poses_admissible(poses):
+                tag = "nominal" if scale == 1.0 else ("rotate" if scale == 0.0 else "slowed")
+                self.filter_counts[tag] += 1
+                # zero-progress steps (v = 0) accumulate toward a stall escalation
+                self._filter_stall = 0 if scale > 0.0 else self._filter_stall + 1
+                return list(poses[0]), tag
+
+        self.filter_counts["blocked"] += 1
+        self._filter_stall += 1
+        return None, "blocked"
+
+    def filter_stalled(self) -> bool:
+        """True once the filter has produced `filter_stall_limit` consecutive
+        zero-progress steps -- the robot is rotating in place or held because the
+        pursued waypoint is itself unreachable, and the tree needs to re-route."""
+        return self._filter_stall >= self.filter_stall_limit
+
     @staticmethod
     def get_distance_and_angle(node_start, node_end):
         dx = node_end.x - node_start.x
@@ -1421,13 +1806,34 @@ class SFF_star:
         iter_max: int,
         safe_regions: List[Sequence[float]],
         HJ_contingency_enable:bool,
+        env_kwargs: dict = None,
+        Tf_reach: float = 8.0,
+        save_mode: bool = False,
+        save_path: str = None,
+        save_every: int = 1,
+        save_fps: int = 10,
         ) -> None:
-        
+
         from HJR_FNO.HJR_FNO3d import HJR_FNO
-        
+
         assert start_goal_index < len(x_goal), "start_goal_index index out of range"
-        
-        
+
+        # ---- video recording (mirrors Navigation2DEnv's save_mode) -------------
+        # Frames are streamed straight to the gif writer instead of being kept in a
+        # list: this figure is 10x10 in at 100 dpi, i.e. ~3 MB per RGB frame, so a
+        # 500-step run would otherwise need >1 GB of RAM.
+        self.save_mode = save_mode
+        self.save_path = save_path or "video/rrtx_FNO3d.gif"
+        self.save_every = max(1, int(save_every))
+        self.save_fps = int(save_fps)
+        self._writer = None
+        self._frame_count = 0
+        self._captured = 0
+        self._frame_shape = None
+        if self.save_mode:
+            # headless rendering: no window, and plt.pause()/plt.show() become no-ops
+            plt.switch_backend("Agg")
+
         #All configs
         self.HJ_contingency_enable = HJ_contingency_enable  #enable contingency constraint in RRTX tree planning
         self.robot_is_isolated = False
@@ -1436,14 +1842,17 @@ class SFF_star:
         x_start = x_goal[start_goal_index]
         self.iter_max = iter_max
         
-        self.env = env.Env(safe_regions=safe_regions)
+        # env_kwargs lets a shared evaluation scenario (eval/scenarios.py) supply the
+        # unknown obstacles and the domain instead of env.py's hard-coded defaults;
+        # env_kwargs=None keeps the original behaviour.
+        self.env = env.Env(safe_regions=safe_regions, **(env_kwargs or {}))
         # Single shared obstacle store: Plotting and every RRTX tree use this same Env, so
         # obstacles detected by the active tree (in-place extend of env.obs_circle) are visible
         # to all trees + plotting instead of living in per-tree private Env copies.
         self.plotting = plotting.Plotting(x_start, x_goal, safe_regions=safe_regions, _env=self.env)
-        
+
         #HJR-FNO configs
-        self.Tf_reach = 8
+        self.Tf_reach = Tf_reach
         self.hjr_fno = HJR_FNO(env=self.env, safe_regions=safe_regions, Tf_reach=self.Tf_reach)
         self.current_state = [x_start[0], x_start[1], heading]
         self.lidar_range = lidar_range
@@ -1507,7 +1916,59 @@ class SFF_star:
         #Color map
         cmap = plt.get_cmap("hsv")
         self.colorList = [cmap(i) for i in np.linspace(0, 1, len(x_goal), endpoint=False)]
-        
+
+    # ------------------------------------------------------------------
+    # video recording (save_mode=True)
+    # ------------------------------------------------------------------
+    def capture_frame(self, fig=None, force: bool = False) -> None:
+        """Append the current figure to the gif. No-op unless save_mode=True.
+
+        Called at every point where the live plot is refreshed; every
+        ``save_every``-th call is written (``force=True`` always writes, used for
+        the final summary frame)."""
+        if not self.save_mode:
+            return
+        self._frame_count += 1
+        if not force and (self._frame_count % self.save_every) != 0:
+            return
+
+        import imageio.v2 as imageio
+
+        fig = fig if fig is not None else self.fig
+        if self._writer is None:
+            os.makedirs(os.path.dirname(self.save_path) or ".", exist_ok=True)
+            self._writer = imageio.get_writer(
+                self.save_path, mode="I", fps=self.save_fps, loop=0
+            )
+        fig.canvas.draw()
+        w, h = fig.canvas.get_width_height()
+        frame = np.frombuffer(fig.canvas.buffer_rgba(), dtype=np.uint8).reshape(h, w, 4)
+        frame = frame[..., :3].copy()                     # drop alpha
+
+        # every gif frame must have the same size, but the final summary plot is a
+        # fresh 8x8 figure while the live one is 10x10 -- resize to the first frame
+        if self._frame_shape is None:
+            self._frame_shape = frame.shape[:2]
+        elif frame.shape[:2] != self._frame_shape:
+            from PIL import Image
+
+            frame = np.asarray(
+                Image.fromarray(frame).resize(
+                    (self._frame_shape[1], self._frame_shape[0]), Image.BILINEAR
+                )
+            )
+
+        self._writer.append_data(frame)
+        self._captured += 1
+
+    def close(self) -> None:
+        """Finalize the gif. Safe to call more than once, and safe when
+        save_mode=False."""
+        if self._writer is not None:
+            self._writer.close()
+            self._writer = None
+            print(f"[save_mode] wrote {self._captured} frames to {self.save_path}")
+
     def on_click(self, event):
         """Handle mouse click events for contingency planning."""
         if event.inaxes != self.ax:
@@ -1582,7 +2043,7 @@ class SFF_star:
                 tree_b = self.rrtx_trees[b]
                 if a in tree_b.other_goals_id:
                     local_j = tree_b.other_goals_id.index(a)
-                    cost = tree_b.other_goals[local_j].cost_to_goal
+                    cost = path_cost(tree_b.other_goals[local_j])
                     D_pat[ia, ib] = cost  # may be inf if path is broken by obstacles
 
         self.D = D_pat
@@ -1654,7 +2115,7 @@ class SFF_star:
             # ---- SPECIAL CASE: robot currently moving from prev_id -> curr_id ----
             if prev_id is not None and curr_id is not None:
                 if i == prev_id and j == curr_id:
-                    remaining = self.rrtx_trees[j].s_bot.cost_to_goal
+                    remaining = path_cost(self.rrtx_trees[j].s_bot)
                     if np.isinf(remaining):
                         return np.inf
                     total_cost += traversed_distance + remaining
@@ -1667,7 +2128,7 @@ class SFF_star:
                 return np.inf  # unreachable
 
             k = tree_i.other_goals_id.index(j)
-            d = tree_i.other_goals[k].cost_to_goal
+            d = path_cost(tree_i.other_goals[k])
 
             if np.isinf(d):
                 return np.inf
@@ -1698,12 +2159,66 @@ class SFF_star:
         rotated = tour[idx:] + tour[:idx] + [start_id]
         return rotated
         
-    def init_trees(self, showPlot=True):        
+    def detect_initial_obstacles(self):
+        """Sense the lidar footprint of the robot's INITIAL pose and register whatever it
+        sees, before any tree is grown.
+
+        Doing this up front rather than on the first execution step means the trees are
+        built collision-free and reachability-feasible from the outset: `planning()`
+        rejects edges via utils.is_collision (which reads the shared obstacle store) and
+        via is_feasible_ray (which reads hjr_fno's value tubes), so both need to know
+        about these obstacles BEFORE the first sample. Otherwise every tree spends its
+        whole initial growth budget wiring edges through obstacles that are already in
+        sensor range, and the first execution step has to tear all of that down --
+        orphaning the robot node and triggering a contingency before it has moved.
+
+        Returns the list of obstacles that were newly detected.
+        """
+        x0, y0 = self.current_state[0], self.current_state[1]
+
+        # Every tree's Utils wraps the SAME Env, so the unknown-obstacle list is one shared
+        # object and lidar_detected() moves entries out of it in place -- sensing once here
+        # is therefore visible to all trees. hjr_fno.utils.sensing_radius is set from
+        # lidar_range in the constructor, same as each tree's.
+        _, detected_obs = self.hjr_fno.utils.lidar_detected(robot_position=(x0, y0))
+
+        if not detected_obs:
+            print(f"[init] no unknown obstacles within lidar range "
+                  f"({self.hjr_fno.utils.sensing_radius}) of the start ({x0:.2f}, {y0:.2f})")
+            return []
+
+        print(f"\n[init] {len(detected_obs)} obstacle(s) detected within lidar range of the "
+              f"start ({x0:.2f}, {y0:.2f}): {detected_obs}")
+
+        # 1) HJ reachable sets first, so the margins/value tubes that is_feasible_ray
+        #    consults during tree growth already account for these obstacles (and the
+        #    scenario certification re-derives delta_hat for the affected regions).
+        if self.HJ_contingency_enable:
+            t0 = time.time()
+            self.hjr_fno.update_obs(detected_obs)
+            print(f"[init] reachable sets updated in {time.time() - t0:.2f} s")
+
+        # 2) Register in the shared obstacle store for collision checking + plotting.
+        #    record=True does that once (the store is shared); the other trees still need
+        #    add_new_obstacle for its per-tree update_gamma, since free-space volume
+        #    changed. NOTE update_obstacles() is deliberately NOT used here: it calls
+        #    verify_queue(self.s_bot), and s_bot is still None until reset_robot_position
+        #    runs in planning(). There is no graph to repair yet either.
+        for i, tree_i in self.rrtx_trees.items():
+            tree_i.add_new_obstacle(detected_obs, record=(i == 0))
+
+        return detected_obs
+
+    def init_trees(self, showPlot=True):
+
+        # Sense and register what is already visible from the start pose, so the trees below
+        # are grown against these obstacles instead of having to be repaired afterwards.
+        self.detect_initial_obstacles()
 
         for i in range(self.n_tree):
-            
+
             print(f"Initialize the tree {i}")
-        
+
             self.rrtx_trees[i].planning()
             
             if showPlot:
@@ -1749,9 +2264,10 @@ class SFF_star:
 
                     # force redraw
                     plt.pause(0.001)
-                
+                    self.capture_frame()
+
                     # ================= END OF PLOTTING =======================
-                    
+
         # # -------------------------------------------------
         # # show intial plot (for K=2 goals case)
         # # -------------------------------------------------
@@ -1960,7 +2476,7 @@ class SFF_star:
         
         # At call site in planning():
         robot_position_costs = {
-            tid: self.rrtx_trees[tid].s_bot.cost_to_goal
+            tid: path_cost(self.rrtx_trees[tid].s_bot)
             for tid in range(self.n_tree)
             if tid not in set(sequence_visited)
         }
@@ -2164,7 +2680,8 @@ class SFF_star:
                     print("robot's position", (self.rrtx_trees[id].s_bot.x, self.rrtx_trees[id].s_bot.y))
                     print("is feasible?", self.hjr_fno.is_feasible(v=np.atleast_2d(self.current_state[:2])))
                     print("robot's Path to goal", self.rrtx_trees[id].robot_path_to_goal)
-                    print("Robot's cost to goal" , self.rrtx_trees[id].s_bot.cost_to_goal)
+                    print("Robot's cost to goal" , self.rrtx_trees[id].s_bot.cost_to_goal,
+                          "| path_cost =", path_cost(self.rrtx_trees[id].s_bot))
                     print("Robot's LMC cost" , self.rrtx_trees[id].s_bot.lmc)
                     print("Path List", self.rrtx_trees[id].path)
                     print("Pending Target", self.rrtx_trees[id]._pending_reset_target)
@@ -2219,7 +2736,7 @@ class SFF_star:
                     # since the contingency trajectory may have moved robot to a reachable position
                     visited_set = set(sequence_visited)
                     self.robot_is_isolated = all(
-                        np.isinf(self.rrtx_trees[tid].s_bot.cost_to_goal)
+                        not has_path_to_goal(self.rrtx_trees[tid].s_bot)
                         for tid in range(self.n_tree)
                         if tid not in visited_set
                     )
@@ -2243,7 +2760,7 @@ class SFF_star:
 
                                     # Update flag
                                     self.rrtx_trees[tid].robot_path_to_goal = (
-                                        self.rrtx_trees[tid].s_bot.cost_to_goal < np.inf
+                                        has_path_to_goal(self.rrtx_trees[tid].s_bot)
                                     )
 
                             recovery_iter += 1
@@ -2253,7 +2770,7 @@ class SFF_star:
                                 for tid in unvisited_set:
                                     print(f"  Tree {tid}: robot_path_to_goal = "
                                         f"{self.rrtx_trees[tid].robot_path_to_goal}, "
-                                        f"cost = {self.rrtx_trees[tid].s_bot.cost_to_goal:.3f}")
+                                        f"cost = {path_cost(self.rrtx_trees[tid].s_bot):.3f}")
 
                             # Safety cutoff to avoid infinite loop
                             if recovery_iter >= 100:
@@ -2311,13 +2828,11 @@ class SFF_star:
                         tree_k.update_obstacles(new_obs, robots_plan=True, record=False)
 
                         # paths/multi_paths already refreshed by refresh_paths(); just update flags
-                        tree_k.robot_path_to_goal = (
-                            tree_k.s_bot is not None and tree_k.s_bot.cost_to_goal < np.inf
-                        )
+                        tree_k.robot_path_to_goal = has_path_to_goal(tree_k.s_bot)
                         if not tree_k.robot_path_to_goal:
                             tree_k.path = []
                         for j, goal_j in enumerate(tree_k.other_goals):
-                            tree_k.path_to_goal[j] = goal_j.cost_to_goal < np.inf
+                            tree_k.path_to_goal[j] = has_path_to_goal(goal_j)
                         # ----------------- End of graph repair in other trees -----------------
 
                 if new_obs_flag:
@@ -2349,7 +2864,7 @@ class SFF_star:
 
                         # Cost from robot's current position to each unvisited goal
                         robot_position_costs = {
-                            tid: self.rrtx_trees[tid].s_bot.cost_to_goal
+                            tid: path_cost(self.rrtx_trees[tid].s_bot)
                             for tid in range(self.n_tree)
                             if tid not in visited_set
                         }
@@ -2430,7 +2945,7 @@ class SFF_star:
                         # Not enough targets left to replan — just print current matrix
                         visited_set = set(sequence_visited)
                         robot_position_costs = {
-                            tid: self.rrtx_trees[tid].s_bot.cost_to_goal
+                            tid: path_cost(self.rrtx_trees[tid].s_bot)
                             for tid in range(self.n_tree)
                             if tid not in visited_set
                         }
@@ -2530,9 +3045,10 @@ class SFF_star:
                         
                     # force redraw
                     plt.pause(0.001)
-                    
+                    self.capture_frame()
+
                     # ================= END OF PLOTTING =======================
-                    
+
                 if new_obs_flag:
                     
                     #Print new distance matrix between each goals after replanning
@@ -2646,13 +3162,19 @@ class SFF_star:
         # Optional: plot start/end markers
         self.ax.scatter(x_traj[0], y_traj[0], color='red', s=60, zorder=5)
         self.ax.scatter(x_traj[-1], y_traj[-1], color='red', s=60, zorder=5)
-        
-        
-        
+
+        if self.save_mode:
+            # hold the summary frame for ~1 s at the end of the gif, save it as a
+            # still next to the gif, then finalize the writer
+            for _ in range(self.save_fps):
+                self.capture_frame(fig=self.fig, force=True)
+            still = os.path.splitext(self.save_path)[0] + "_final.png"
+            self.fig.savefig(still, dpi=130, bbox_inches="tight")
+            print(f"[save_mode] wrote final plot to {still}")
+            self.close()
+
         plt.show()
-        
-        
-        
+
         return data
         
         
@@ -2922,8 +3444,69 @@ class SFF_star:
 
         return True, (x0, y0)
         
-def main():
-    
+def main(scenario: str = None, save_mode: bool = False, save_path: str = None,
+         save_every: int = 1, seed: int = None):
+    """
+    scenario: optional name of a shared evaluation scenario from eval/scenarios.py
+        ("env_A", "env_B", ...) or a path to a scenario .json.
+        When given, the safe regions / unknown obstacles / start / goal / lidar all
+        come from it, so this run is directly comparable to the MPPI run on the same
+        scenario (mppi_src/navigation2d.py --scenario ...). When None, the hard-coded
+        configuration below is used, exactly as before.
+    save_mode: record the live plot to a gif (headless, Agg backend) instead of
+        showing a window -- the RRTX counterpart of Navigation2DEnv's save_mode.
+        Defaults to video/rrtx_FNO3d_<scenario>.gif; a still of the final plot is
+        written alongside it as *_final.png. The gif is finalized even if the run
+        errors out or never reaches the goal.
+    save_every: keep only every N-th frame (use 2-5 for long runs to shrink the gif).
+    seed: seed numpy + random so a run is reproducible. Sampling is otherwise
+        unseeded, so two runs of the same scenario grow different trees and a
+        failure cannot be re-observed -- pass a seed when debugging.
+    """
+    if seed is not None:
+        np.random.seed(seed)
+        random.seed(seed)
+        print(f"[seed] numpy + random seeded with {seed}")
+
+    if scenario is not None:
+        from eval.scenarios import get_scenario, rrtx_kwargs
+
+        # seed selects the obstacle layout too -- see rrtx_FNO3d_oneGoal.py, which
+        # is the active driver; this one follows it so the two cannot diverge.
+        sc = get_scenario(scenario, seed)
+        kw = rrtx_kwargs(sc)
+        print(f"[scenario] {sc.tag}: {len(sc.safe_regions)} safe regions, "
+              f"{len(sc.obstacles)} obstacles, domain +/-{sc.domain}"
+              + (f", obstacles RANDOM (seed {sc.obs_seed}, digest {sc.obs_digest})"
+                 if sc.obs_seed is not None else ", obstacles hand-authored"))
+
+        sff = SFF_star(
+            start_goal_index=kw["start_goal_index"],
+            x_goal=kw["x_goal"],
+            heading=kw["heading"],
+            lidar_range=kw["lidar_range"],
+            step_len=1.5,
+            gamma_FOS=20.0,
+            epsilon=0.05,
+            bot_sample_rate=0.10,
+            iter_max=1000,
+            safe_regions=kw["safe_regions"],
+            HJ_contingency_enable=True,
+            env_kwargs=kw["env_kwargs"],
+            Tf_reach=kw["Tf_reach"],
+            save_mode=save_mode,
+            save_path=save_path or f"video/rrtx_FNO3d_{sc.name}.gif",
+            save_every=save_every,
+        )
+        # finalize the gif no matter how the run ends (goal reached, exception, or
+        # Ctrl-C) so a partial recording is still viewable
+        try:
+            sff.init_trees(showPlot=True)
+            state_history = sff.planning(hamiltonian_cycle=False, showPlot=True)
+        finally:
+            sff.close()
+        return sff, state_history
+
     # #load configs
     # with open("config.yaml", "r") as f:
     #     cfg = yaml.safe_load(f)
@@ -2937,13 +3520,18 @@ def main():
     
     #case 1 (K=6):
     # x_goal = [(-17, 16),  (-11, -14), (5,10), (14, 18), (15,-7)] 
+
+    xy_start = (-12.94, 17)
+    xy_end = ( -8.44, -5.77)
     x_goal = [
-        (-12.94, 17),
-        ( -8.44, -5.77),
+        xy_start,
+        xy_end,
         # (  3.81,  8.73),
         # ( 10.56, 14.73),
         # ( 11, -7),
-    ]
+    ] #rrtx goal roots (including start)
+
+    
     start_goal_index=0
     # safe_region = [[-15, 19, 2],
     #                 [-10, -9, 2],
@@ -3033,7 +3621,7 @@ def main():
         x_goal=x_goal, 
         heading=0.0,
         lidar_range=8, # 12, #, #4.8
-        step_len= 3.0,  #3.0
+        step_len= 1.5,  #NOTE 1.5 is set to match the 'lookahead' in Dubin's pure pursuit tracker
         gamma_FOS = 20.0,#100.0,
         epsilon=0.05,
         bot_sample_rate=0.10,  
@@ -3145,7 +3733,22 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    # optional: python rrtx_FNO3d.py env_A --save_mode --save_every 2
+    import argparse
+
+    _ap = argparse.ArgumentParser(description="RRTX-HJR contingency planner")
+    _ap.add_argument("scenario", nargs="?", default=None,
+                     help="eval/scenarios.py name or path to a scenario .json")
+    _ap.add_argument("--save_mode", action="store_true",
+                     help="record the run to a gif (headless) instead of showing a window")
+    _ap.add_argument("--save_path", default=None, help="output .gif path")
+    _ap.add_argument("--save_every", type=int, default=1, help="keep every N-th frame")
+    _ap.add_argument("--seed", type=int, default=None,
+                     help="seed numpy + random for a reproducible run (sampling is "
+                          "otherwise unseeded, so no two runs grow the same tree)")
+    _args = _ap.parse_args()
+    main(_args.scenario, save_mode=_args.save_mode,
+         save_path=_args.save_path, save_every=_args.save_every, seed=_args.seed)
 
 '''
 TODO:

@@ -38,11 +38,11 @@ class MPPI(nn.Module):
         lambda_min: float = 0.01,
         lambda_max: float = 10.0,
         exploration: float = 0.0,
-        noise_beta: float = 0.0,
         use_rbr: bool = False,
         constraint_func: Optional[
             Callable[[torch.Tensor, Dict], torch.Tensor]
         ] = None,
+        prev_group_frac: float = 0.4,
         use_sg_filter: bool = False,
         sg_window_size: int = 5,
         sg_poly_order: int = 3,
@@ -77,23 +77,25 @@ class MPPI(nn.Module):
         Sampling args:
             exploration: Fraction of purely random samples (0 to 1).
                 Default: 0.0 (all samples inherit from previous solution).
-            noise_beta: Temporal correlation of the sampling noise via an
-                AR(1) process along the horizon (0 = white noise = original
-                behavior; ->1 = increasingly smooth/low-frequency). Variance-
-                preserving, so it composes with sigmas. Higher values produce
-                sustained turns that fan the rollouts out spatially rather than
-                jittering in place. Default: 0.0.
 
-        RBR args:
-            use_rbr: Enable Resampling-Based Rollouts. Propagates the batch one
-                step at a time and, after each step, resamples any
-                constraint-violating particle onto a uniformly chosen feasible
-                one (donor state/control prefix copied; the violator's own
-                future noise is kept). Keeps all samples inside the feasible set
-                so none are wasted. Requires constraint_func. Default: False.
-            constraint_func: Hard constraint indicator
+        Robust-pipeline args (use_rbr is the MASTER switch: with use_rbr=False
+        this is plain Williams-2017 MPPI and every feature below is inert,
+        including set_group_means()):
+            use_rbr: Propagate the batch one step at a time and, after each step,
+                resample any constraint-violating particle onto a uniformly
+                chosen feasible one (donor state/control prefix copied; the
+                violator's own future noise kept). Keeps all rollouts inside the
+                feasible set. Also enables guided multi-group sampling and the
+                safety filter on control selection. Requires constraint_func.
+                Default: False (plain MPPI, behavior byte-identical to no-RBR).
+            constraint_func: hard feasibility indicator
                 (state (num_samples, dim_state), info) -> bool (num_samples,),
                 True where the state is feasible. Only used when use_rbr=True.
+
+        Guided multi-group args (only active after set_group_means(means)):
+            prev_group_frac: fraction of the sample budget reserved for the
+                previous-MPPI-mean group (the LAST group); the remaining budget
+                is split equally across the M ancillary means. Default: 0.4.
 
         Filtering args:
             use_sg_filter: Apply Savitzky-Golay filter for smoothing.
@@ -138,18 +140,42 @@ class MPPI(nn.Module):
         self._u_max = u_max.clone().detach().to(self._device, self._dtype)
         self._sigmas = sigmas.clone().detach().to(self._device, self._dtype)
         self._exploration = exploration
-        self._noise_beta = noise_beta
         self._use_rbr = use_rbr
         self._constraint_func = constraint_func
-        # Fraction of (particle, step) pairs resampled in the last forward()
-        # (diagnostic: how many rollouts RBR rescued from infeasibility).
+        # Single master gate for the whole robust pipeline: resampling-based
+        # rollouts, group-confined resampling, guided multi-group sampling and
+        # the control-selection safety filter. When this is False the solver is
+        # plain Williams-2017 MPPI and set_group_means() is a no-op, so nothing a
+        # caller does can change the simplest path.
+        self._robust = bool(use_rbr) and constraint_func is not None
+        # RBR diagnostics (updated in _rollout_cost_rbr) + safety-filter selection
         self._rbr_resample_frac = 0.0
-        # Diagnostics for the RBR mean-collapse investigation:
-        #   _rbr_min_num_safe : fewest feasible particles at any rollout step
-        #                       (small -> batch collapses onto few donors).
-        #   _rbr_num_allunsafe: how many rollout steps had zero feasible donors.
         self._rbr_min_num_safe = num_samples
         self._rbr_num_allunsafe = 0
+        self._safety_selection = "mean"  # 'mean' | 'sample' | 'fallback'
+
+        # ---- guided multi-group state (inactive until set_group_means) -------
+        # _group_means: (M, horizon, dim_control) ancillary means, or None for
+        #   the single-group (plain) case, which stays byte-identical.
+        # _group_of: (num_samples,) group index per sample, fixed by the budget
+        #   allocation; group G-1 is always the previous-MPPI-mean group.
+        # _group_of_eff: group labels AFTER RBR resampling -- a particle reseeded
+        #   from a dead group's donor adopts the donor's group, so this is the
+        #   label that describes the trajectory actually rolled out.
+        self._prev_group_frac = float(prev_group_frac)
+        self._group_means: Optional[torch.Tensor] = None
+        self._num_groups = 1
+        self._group_of = torch.zeros(
+            num_samples, dtype=torch.long, device=self._device
+        )
+        self._group_of_eff = self._group_of
+        # diagnostics
+        self._group_mass: Optional[torch.Tensor] = None
+        self._group_score: Optional[torch.Tensor] = None
+        self._group_counts: Optional[torch.Tensor] = None
+        self._group_dead: Optional[torch.Tensor] = None
+        self._selected_group = 0
+
         self._use_sg_filter = use_sg_filter
         self._sg_window_size = sg_window_size
         self._sg_poly_order = sg_poly_order
@@ -254,6 +280,77 @@ class MPPI(nn.Module):
             self._horizon - 1, self._dim_control, device=self._device, dtype=self._dtype
         )  # previous inputted actions for sg filter
 
+    def set_group_means(self, means: Optional[torch.Tensor]) -> None:
+        """Install M ancillary proposal means for guided multi-group sampling.
+
+        Call once per control step, BEFORE forward(). The M means (e.g. control
+        sequences tracking M homotopy-distinct topo-PRM paths) become groups
+        0..M-1; the previous-MPPI mean is always the LAST group (index M), so
+        there are G = M+1 groups. The sample budget is split by
+        _allocate_groups, each sample is perturbed around ITS OWN group's mean,
+        RBR resampling is confined within groups, and control selection is
+        winner-take-all over groups (see forward()).
+
+        No-op unless use_rbr=True (with a constraint_func): guided sampling is
+        part of the robust pipeline, so plain MPPI cannot be perturbed by it.
+
+        Args:
+            means: (M, horizon, dim_control) tensor, or None to return to plain
+                single-group MPPI (byte-identical to never calling this).
+        """
+        if not self._robust:
+            return
+        if means is None:
+            if self._num_groups != 1:
+                self._num_groups = 1
+                self._group_of = torch.zeros(
+                    self._num_samples, dtype=torch.long, device=self._device
+                )
+                self._group_of_eff = self._group_of
+            self._group_means = None
+            return
+
+        means = torch.as_tensor(means, device=self._device, dtype=self._dtype)
+        assert means.ndim == 3 and means.shape[1:] == (
+            self._horizon,
+            self._dim_control,
+        ), f"group means must be (M, {self._horizon}, {self._dim_control})"
+        assert self._exploration == 0.0, (
+            "exploration>0 replaces a tail slice of the batch with raw zero-mean "
+            "noise, which would silently overwrite the last group; unsupported "
+            "with group means."
+        )
+
+        self._group_means = means
+        num_groups = means.shape[0] + 1
+        if num_groups != self._num_groups:
+            self._num_groups = num_groups
+            self._group_of = self._allocate_groups(num_groups)
+        self._group_of_eff = self._group_of
+
+    def _allocate_groups(self, num_groups: int) -> torch.Tensor:
+        """Sample budget -> per-sample group label, shape (num_samples,).
+
+        The previous-MPPI-mean group (LAST index) gets prev_group_frac of the
+        budget; the rest is split as equally as possible across the ancillary
+        means, with the remainder handed to the earliest groups. Labels are
+        contiguous blocks, which keeps the index_select in sampling cheap.
+        """
+        n = self._num_samples
+        if num_groups <= 1:
+            return torch.zeros(n, dtype=torch.long, device=self._device)
+
+        n_prev = int(round(self._prev_group_frac * n))
+        # every group needs at least one sample (donor pool + weight mass)
+        n_prev = max(1, min(n_prev, n - (num_groups - 1)))
+        rest, num_anc = n - n_prev, num_groups - 1
+        base, rem = divmod(rest, num_anc)
+        counts = [base + (1 if i < rem else 0) for i in range(num_anc)] + [n_prev]
+        return torch.repeat_interleave(
+            torch.arange(num_groups, device=self._device),
+            torch.tensor(counts, device=self._device),
+        )
+
     def forward(
         self, state: torch.Tensor, info: Dict = {}
     ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -296,19 +393,23 @@ class MPPI(nn.Module):
             sample_shape=self._sample_shape
         )
 
-        # Temporally correlate the noise (colored noise) so rollouts fan out
-        # spatially instead of jittering in place. No-op when noise_beta == 0.
-        if self._noise_beta > 0.0:
-            self._action_noises = self._apply_temporal_correlation(
-                self._action_noises, self._noise_beta
+        if self._group_means is None:
+            # ---- plain single-mean sampling (unchanged) ----
+            # Split samples: (1-exploration) inherit from previous, rest are random
+            threshold = int(self._num_samples * (1 - self._exploration))
+            inherited_samples = mean_action_seq + self._action_noises[:threshold]
+            self._perturbed_action_seqs = torch.cat(
+                [inherited_samples, self._action_noises[threshold:]]
             )
-
-        # Split samples: (1-exploration) inherit from previous, rest are random
-        threshold = int(self._num_samples * (1 - self._exploration))
-        inherited_samples = mean_action_seq + self._action_noises[:threshold]
-        self._perturbed_action_seqs = torch.cat(
-            [inherited_samples, self._action_noises[threshold:]]
-        )
+        else:
+            # ---- guided multi-group sampling ----
+            # Groups 0..M-1 are the ancillary (topo-PRM) means, group M is the
+            # previous-MPPI mean. Each sample is perturbed around ITS OWN mean.
+            all_means = torch.cat(
+                [self._group_means, mean_action_seq.unsqueeze(0)], dim=0
+            )  # (G, horizon, dim_control)
+            means_per_sample = all_means.index_select(0, self._group_of)
+            self._perturbed_action_seqs = means_per_sample + self._action_noises
 
         # Enforce control limits
         self._perturbed_action_seqs = torch.clamp(
@@ -316,17 +417,20 @@ class MPPI(nn.Module):
         )
 
         # =================================================================
-        # Step 2 & 3: Rollout dynamics and accumulate trajectory costs
+        # Step 2 & 3: Rollout dynamics and compute trajectory costs
         # =================================================================
-        if self._use_rbr and self._constraint_func is not None:
-            # Resampling-Based Rollouts: propagate step-by-step and resample any
-            # constraint-violating particle onto a feasible one. Tell the cost a
-            # hard constraint is already enforced so it can skip a redundant
-            # feasibility penalty (and its expensive per-step reachability eval).
+        # effective group labels default to the allocation; RBR may relabel
+        # particles it reseeds across groups (see _rollout_cost_rbr)
+        self._group_of_eff = self._group_of
+        self._group_dead = None
+        if self._robust:
+            # Resampling-Based Rollouts: step-wise rollout that resamples any
+            # constraint-violating particle onto a feasible one. Advertise the
+            # hard constraint so the cost can skip a redundant feasibility term.
             info["rbr_active"] = True
             costs = self._rollout_cost_rbr(state, info)
         else:
-            info["rbr_active"] = False
+            # ---- plain MPPI (unchanged) ----
             self._state_seq_batch[:, 0, :] = state.repeat(self._num_samples, 1)
 
             for t in range(self._horizon):
@@ -424,10 +528,35 @@ class MPPI(nn.Module):
         # =================================================================
         # Step 6: Compute optimal action as weighted average
         # =================================================================
+        # Weighted mean over ALL trajectories from ALL groups. With group means
+        # active this is a mixture-proposal average, so it may fall between
+        # homotopy classes and leave the (non-convex) safe set -- that is exactly
+        # what the safety filter in Step 8 checks and repairs.
         optimal_action_seq = torch.sum(
             self._weights.view(self._num_samples, 1, 1) * self._perturbed_action_seqs,
             dim=0,
         )
+
+        if self._group_means is not None:
+            # DIAGNOSTICS ONLY (not used for control): per-group weight mass, and
+            # mass PER SAMPLE. Raw mass scales with a group's sample budget, so
+            # with prev_group_frac=0.4 the previous-mean group has a ~4x head
+            # start at M=6; the normalized score is the budget-free comparison of
+            # how good a TYPICAL sample of each mode is. `_selected_group` is the
+            # argmax of that score and is used only for reporting / the overlay.
+            groups = self._group_of_eff
+            mass = torch.zeros(
+                self._num_groups, device=self._device, dtype=self._dtype
+            )
+            mass.index_add_(0, groups, self._weights)
+            counts = torch.bincount(groups, minlength=self._num_groups)
+            score = mass / counts.clamp(min=1).to(self._dtype)
+            score = torch.where(counts > 0, score, torch.full_like(score, -1.0))
+            self._group_mass = mass
+            self._group_score = score
+            self._group_counts = counts
+            self._selected_group = int(torch.argmax(score))
+
         mean_action_seq = optimal_action_seq
 
         if self._auto_lambda == "MPO":
@@ -489,39 +618,42 @@ class MPPI(nn.Module):
             optimal_action_seq = filtered_action_seq[-self._horizon :]
 
         # =================================================================
-        # Step 8: Predict state sequence and update history
+        # Step 8: Control selection (safety filter), predict, update history
         # =================================================================
-        expanded_optimal_action_seq = optimal_action_seq.repeat(1, 1, 1)
-        optimal_state_seq = self._states_prediction(state, expanded_optimal_action_seq)
-
-        # Store for warm-starting next iteration
+        # Warm-start next iteration with the weighted MEAN (unchanged).
         self._previous_action_seq = optimal_action_seq
 
-        # Update action history for Savitzky-Golay filter
-        optimal_action = optimal_action_seq[0]
+        # Safety filter is active ONLY in the robust pipeline: the weighted mean
+        # over ALL groups can leave the (non-convex) safe set, so the EXECUTED
+        # sequence is chosen separately. Without RBR this is a no-op and the
+        # executed sequence IS the weighted mean, so the plain path is
+        # byte-identical to Williams-2017.
+        if self._robust:
+            executed_seq = self._safety_filter(state, optimal_action_seq, costs)
+        else:
+            executed_seq = optimal_action_seq
+
+        expanded_optimal_action_seq = executed_seq.repeat(1, 1, 1)
+        optimal_state_seq = self._states_prediction(state, expanded_optimal_action_seq)
+
+        # Update action history for Savitzky-Golay filter (with executed action)
+        optimal_action = executed_seq[0]
         self._actions_history_for_sg = torch.cat(
             [self._actions_history_for_sg[1:], optimal_action.view(1, -1)]
         )
 
-        return optimal_action_seq, optimal_state_seq
+        return executed_seq, optimal_state_seq
 
     def _rollout_cost_rbr(self, state: torch.Tensor, info: Dict) -> torch.Tensor:
-        """Resampling-Based Rollouts (RBR): step-wise rollout with mid-rollout
+        """Resampling-Based Rollouts: step-wise rollout with mid-rollout
         resampling of constraint-violating particles.
 
-        At each step: propagate every particle one step, evaluate the hard
-        constraint on the newly reached state, then replace each infeasible
-        particle by a UNIFORMLY chosen feasible donor. Only the donor's
-        state/control PREFIX (and accumulated cost) are copied; the violator's
-        own future controls (suffix noise) are kept and simply applied from the
-        donor's feasible state onward. This keeps all samples inside the
-        feasible set while preserving exploration diversity.
-
-        Mutates self._state_seq_batch and self._perturbed_action_seqs in place
-        (the latter is "rewired" so the returned optimal action uses the actual
-        feasible trajectories' controls). Returns the summed trajectory cost,
-        shape (num_samples,).
-        """
+        At each step: accumulate the stage cost, propagate one step, evaluate the
+        hard constraint on the newly reached state, then replace each infeasible
+        particle by a UNIFORMLY chosen feasible donor -- copying only the donor's
+        state/control PREFIX (and accumulated cost) while KEEPING the violator's
+        own future controls (suffix noise). Mutates self._state_seq_batch and
+        self._perturbed_action_seqs in place; returns the summed cost (N,)."""
         N, T, device, dtype = (
             self._num_samples,
             self._horizon,
@@ -536,6 +668,15 @@ class MPPI(nn.Module):
         total_resampled = 0
         min_num_safe = N
         num_allunsafe = 0
+
+        # Working group labels: a particle that gets reseeded from ANOTHER group
+        # (because its own group died) adopts the donor's group, which the
+        # gather below does for free. Confined resampling then stays consistent
+        # on later steps, and the final labels describe the trajectories that
+        # were actually rolled out.
+        num_groups = self._num_groups
+        group_id = self._group_of.clone()
+        group_dead = torch.zeros(num_groups, dtype=torch.bool, device=device)
 
         for t in range(T):
             x_t = self._state_seq_batch[:, t, :]
@@ -558,27 +699,48 @@ class MPPI(nn.Module):
             safe_idx = torch.nonzero(safe, as_tuple=False).view(-1)
             num_safe = safe_idx.numel()
 
-            # diagnostics: track the tightest feasibility bottleneck this rollout
             min_num_safe = min(min_num_safe, num_safe)
             if num_safe == 0:
                 num_allunsafe += 1
 
-            # Resample only when there is at least one donor AND at least one
-            # violator. num_safe == 0 -> no feasible donor this step, leave the
-            # batch untouched (graceful fallback to plain MPPI); num_safe == N ->
-            # nothing to resample.
+            # Resample only when there is at least one donor AND one violator.
+            # num_safe == 0 -> no donor, leave batch untouched (plain-MPPI
+            # fallback this step); num_safe == N -> nothing to resample.
             if 0 < num_safe < N:
-                unsafe_idx = torch.nonzero(~safe, as_tuple=False).view(-1)
-                donors = safe_idx[
-                    torch.randint(num_safe, (unsafe_idx.numel(),), device=device)
-                ]
                 resample_idx = all_idx.clone()
-                resample_idx[unsafe_idx] = donors
-                total_resampled += int(unsafe_idx.numel())
 
-                # copy donor PREFIX only: states x_0..x_{t+1} and controls u_0..u_t,
-                # plus the accumulated cost. Suffix controls (u_{t+1..}) are left
-                # untouched so each rescued particle keeps its own future noise.
+                if num_groups == 1:
+                    unsafe_idx = torch.nonzero(~safe, as_tuple=False).view(-1)
+                    donors = safe_idx[
+                        torch.randint(num_safe, (unsafe_idx.numel(),), device=device)
+                    ]
+                    resample_idx[unsafe_idx] = donors
+                    total_resampled += int(unsafe_idx.numel())
+                else:
+                    # CONFINED resampling: a violator may only clone a survivor
+                    # that shares its proposal mean, so a group cannot leak into
+                    # another's homotopy class. A group with NO survivors is dead:
+                    # it is reseeded from the global survivor pool (its budget is
+                    # recycled rather than wasted) and, via the gather, its
+                    # particles adopt the donor's group label -- i.e. the dead
+                    # homotopy class is removed from the mixture.
+                    for gi in range(num_groups):
+                        in_g = group_id == gi
+                        viol_idx = torch.nonzero(in_g & ~safe, as_tuple=False).view(-1)
+                        if viol_idx.numel() == 0:
+                            continue
+                        pool = torch.nonzero(in_g & safe, as_tuple=False).view(-1)
+                        if pool.numel() == 0:
+                            group_dead[gi] = True
+                            pool = safe_idx  # global reseed (num_safe > 0 here)
+                        resample_idx[viol_idx] = pool[
+                            torch.randint(pool.numel(), (viol_idx.numel(),), device=device)
+                        ]
+                        total_resampled += int(viol_idx.numel())
+
+                # copy donor PREFIX only (states x_0..x_{t+1}, controls u_0..u_t,
+                # accumulated cost); suffix controls u_{t+1..} are left untouched
+                # so each rescued particle keeps its own future noise.
                 self._state_seq_batch[:, : t + 2, :] = self._state_seq_batch[
                     resample_idx, : t + 2, :
                 ]
@@ -586,6 +748,7 @@ class MPPI(nn.Module):
                     self._perturbed_action_seqs[resample_idx, : t + 1, :]
                 )
                 cost_acc = cost_acc[resample_idx]
+                group_id = group_id[resample_idx]
 
         # terminal cost on the final (feasible) state
         info["prev_state"] = self._state_seq_batch[:, -2, :]
@@ -597,7 +760,87 @@ class MPPI(nn.Module):
         self._rbr_resample_frac = total_resampled / float(N * T)
         self._rbr_min_num_safe = min_num_safe
         self._rbr_num_allunsafe = num_allunsafe
+        self._group_of_eff = group_id
+        self._group_dead = group_dead
         return cost_acc + terminal_costs
+
+    def _safety_filter(
+        self, state: torch.Tensor, mean_seq: torch.Tensor, costs: torch.Tensor
+    ) -> torch.Tensor:
+        """Select the control sequence to EXECUTE (robust pipeline only).
+
+        The MPPI weighted mean is taken over all trajectories from ALL groups, so
+        it may violate the contingency constraint: the safe control set is
+        non-convex, and an average of safe sequences need not be safe. So:
+
+          1. simulate ONE step from the mean and test the value function. If
+             V < -delta, execute the mean.
+          2. otherwise execute the first control of the lowest-cost SAMPLED
+             trajectory that satisfies V < -delta at EVERY step.
+          3. if no sample qualifies, fall back to the mean (flagged 'fallback').
+
+        The V < -delta test is exactly `constraint_func`: points_feasible
+        thresholds the value at `safe_margin - feasibility_buffer`, and
+        safe_margin IS the certified -delta (negative, e.g. -0.6). So there is no
+        separate value plumbing and the filter can never disagree with the
+        constraint RBR enforced during the rollouts.
+
+        Note on cost: branch 2 evaluates the constraint on all N*(H+1) rollout
+        states in one batched call. RBR has already driven most of them feasible,
+        so this is a correctness backstop rather than the common path."""
+        cf = self._constraint_func
+
+        # (1) one-step check on the weighted mean
+        x1 = self._dynamics(state.view(1, -1), mean_seq[0].view(1, -1))
+        if bool(cf(x1, {}).to(torch.bool).view(-1)[0]):
+            self._safety_selection = "mean"
+            return mean_seq
+
+        # (2) lowest-cost sample feasible at every step.
+        # Index 0 is the CURRENT state, shared by every sample and not a decision
+        # variable, so it is excluded: if the robot is momentarily outside the set
+        # (V >= -delta), including it would disqualify all N samples and disarm
+        # the filter exactly when it is needed most. Steps 1..H are what the
+        # candidate controls actually determine.
+        N = self._num_samples
+        Hs = self._state_seq_batch.shape[1]
+        flat = self._state_seq_batch.reshape(N * Hs, self._dim_state)
+        feas = cf(flat, {}).to(torch.bool).view(N, Hs)
+        feasible_all = feas[:, 1:].all(dim=1)
+        if bool(feasible_all.any()):
+            masked = torch.where(
+                feasible_all, costs, torch.full_like(costs, float("inf"))
+            )
+            best = int(torch.argmin(masked))
+            self._safety_selection = "sample"
+            return self._perturbed_action_seqs[best]
+
+        self._safety_selection = "fallback"
+        return mean_seq
+
+    def diagnostics(self) -> str:
+        """One-line summary of the last forward(): group selection, per-group
+        weight mass and RBR resampling. Empty-ish when nothing is active."""
+        parts = []
+        if self._group_means is not None and self._group_counts is not None:
+            last = self._num_groups - 1
+            sel = self._selected_group
+            tag = "prev" if sel == last else f"topo{sel}"
+            mass = " ".join(f"{m:.2f}" for m in self._group_mass.tolist())
+            # 'best' is the diagnostic argmax of mass-per-sample, NOT a control
+            # decision -- the executed sequence comes from the safety filter.
+            parts.append(f"G={self._num_groups} best={tag} mass=[{mass}]")
+            if self._group_dead is not None and bool(self._group_dead.any()):
+                dead = torch.nonzero(self._group_dead).view(-1).tolist()
+                parts.append(f"dead={dead}")
+        if self._robust:
+            parts.append(
+                f"sel={self._safety_selection} "
+                f"resample={100 * self._rbr_resample_frac:.1f}% "
+                f"minsafe={self._rbr_min_num_safe} "
+                f"allunsafe={self._rbr_num_allunsafe}"
+            )
+        return " | ".join(parts)
 
     def get_top_samples(self, num_samples: int) -> Tuple[torch.Tensor, torch.Tensor]:
         """Get the top-weighted trajectory samples.
@@ -662,32 +905,6 @@ class MPPI(nn.Module):
                 state_seqs[:, t, :], action_seqs[:, t, :]
             )
         return state_seqs
-
-    def _apply_temporal_correlation(
-        self, noise: torch.Tensor, beta: float
-    ) -> torch.Tensor:
-        """Correlate the per-step noise along the horizon with an AR(1) process.
-
-        e_0 = w_0,  e_t = beta * e_{t-1} + sqrt(1 - beta^2) * w_t
-
-        The sqrt(1 - beta^2) factor keeps the marginal (per-step) variance equal
-        to the input's, so this only shapes the *time* spectrum of the noise
-        (low-frequency as beta -> 1) without changing sigmas. Correlated steering
-        noise produces sustained turns, which is what fans the rollouts out in
-        x-y instead of averaging back to a straight line.
-
-        Args:
-            noise: shape (num_samples, horizon, dim_control).
-            beta: AR(1) coefficient in [0, 1).
-        Returns:
-            Correlated noise, same shape.
-        """
-        correlated = torch.empty_like(noise)
-        correlated[:, 0, :] = noise[:, 0, :]
-        scale = math.sqrt(max(0.0, 1.0 - beta * beta))
-        for t in range(1, noise.shape[1]):
-            correlated[:, t, :] = beta * correlated[:, t - 1, :] + scale * noise[:, t, :]
-        return correlated
 
     def _compute_ess(self, weights: torch.Tensor) -> float:
         """Compute Effective Sample Size (ESS).

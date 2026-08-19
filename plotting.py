@@ -186,8 +186,14 @@ class Plotting:
             ax.draw_artist(lidar_patch)
         
     
+    @staticmethod
+    def _theta_slice(theta_array, theta):
+        """Nearest theta index, wrapping between [-pi, pi)."""
+        lo = float(theta_array[0])
+        return int(np.argmin(np.abs(theta_array - (lo + (theta - lo) % (2 * np.pi)))))
+
     def plot_reachable_set(self, ax, hjr_fno, theta, time):
-        
+
         for i in range(hjr_fno.num_safe_regions):
             
             reachable_set = hjr_fno.HJR_sets[i]
@@ -196,7 +202,7 @@ class Plotting:
             if not hjr_fno.obs_list[i]:
                 
                 '''reachable set'''
-                theta_slice = np.argmin(np.abs(hjr_fno.theta_array_fine - theta))
+                theta_slice = self._theta_slice(hjr_fno.theta_array_fine, theta)
                 # index 0 = fully grown: flip the ascending-time argmin
                 time_slice  = (len(hjr_fno.time_array_fine) - 1) - np.argmin(np.abs(hjr_fno.time_array_fine - time))
 

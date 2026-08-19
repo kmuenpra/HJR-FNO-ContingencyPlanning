@@ -1,0 +1,67 @@
+=== pre-flight ===
+=== eval/config.yaml (global defaults) ===
+  dt_c            : 0.1 s
+  v_max / w_max   : 1.0 m/s / 1.0 rad/s (turn radius 1.00 m)
+  u_min / u_max   : [0.0, -1.0] / [1.0, 1.0]
+  lidar_radius    : 7.0 m
+  goal_threshold  : 0.5 m
+  Tf_reach        : 8.0 s  (solved horizon 8.0 s)
+  d_max           : [0.1, 0.1, 0.1]  (rollout [0.0, 0.0, 0.0])
+  feasibility     : feasible_region
+  scenario_parallel: True
+  reach grid      : 50x50x25x17 on [-10.0, 10.0]^2 x [-3.142, 3.142) region-local
+
+=== env_A =============================================================
+
+=== env_B =============================================================
+
+=== env_C =============================================================
+
+=== env_D =============================================================
+
+========================================================================
+all 44 checks passed (4 skipped)
+  config + accounting invariants OK
+
+=== env_A  (max_steps=1100) ===
+  arm4 rrtx_fno     env_A s1         ok     28s  K_e 351 steps | L_e 35.09 m | T_e 35.1 s | T_deployed 46.9 s (RTF_ep 1.34) | goal True
+  arm4 rrtx_fno     env_A s2         ok     28s  K_e 351 steps | L_e 35.09 m | T_e 35.1 s | T_deployed 46.8 s (RTF_ep 1.33) | goal True
+
+=== env_B  (max_steps=900) ===
+  arm4 rrtx_fno     env_B s1         ok     33s  K_e 331 steps | L_e 32.40 m | T_e 33.1 s | T_deployed 48.1 s (RTF_ep 1.45) | goal True
+  arm4 rrtx_fno     env_B s2         ok     34s  K_e 388 steps | L_e 37.09 m | T_e 38.8 s | T_deployed 55.1 s (RTF_ep 1.42) | goal True
+
+=== env_C  (max_steps=850) ===
+  arm4 rrtx_fno     env_C s1         ok     29s  K_e 317 steps | L_e 29.30 m | T_e 31.7 s | T_deployed 42.2 s (RTF_ep 1.33) | goal True
+  arm4 rrtx_fno     env_C s2         ok     30s  K_e 284 steps | L_e 28.08 m | T_e 28.4 s | T_deployed 40.4 s (RTF_ep 1.42) | goal True
+
+=== env_D  (max_steps=1400) ===
+  arm4 rrtx_fno     env_D s1         ok     48s  K_e 564 steps | L_e 53.54 m | T_e 56.4 s | T_deployed 77.3 s (RTF_ep 1.37) | goal True
+  arm4 rrtx_fno     env_D s2         ok     48s  K_e 602 steps | L_e 54.23 m | T_e 60.2 s | T_deployed 81.0 s (RTF_ep 1.35) | goal True
+
+=== scoring ===
+
+arm             env    knob          n               SR     VR%     D_e    barL   T_e s   RTFep   plan50   plan95   reach50  RTFp99    DMR%
+-------------------------------------------------------------------------------------------------------------------------------------------
+mppi            env_A  H=40 N=1000   2    100% [34,100]    0.00   0.000   1.003    42.0    1.25     46.3     48.0       963    10.1     1.9
+mppi            env_B  H=40 N=1000   2    100% [34,100]    0.00   0.000   1.505    77.9    1.17     48.9     51.3      1162     9.6     1.2
+mppi            env_C  H=40 N=1000   2    100% [34,100]    0.00   0.000   1.024    34.1    1.34     47.3     49.1       969     9.5     1.8
+mppi            env_D  H=40 N=1000   2        0% [0,66]    0.00   0.000      --   140.0    1.04     48.8     50.7      2368     0.5     0.1
+rrtx_fno        env_A  n=1000        2    100% [34,100]    0.00   0.000   1.008    35.2    1.33     40.7     73.0       990    11.2     4.3
+rrtx_fno        env_A  n=3000        2    100% [34,100]    0.00   0.000   1.007    35.1    1.34     22.5     36.9       989    11.9     2.9
+rrtx_fno        env_B  n=1000        2    100% [34,100]    0.00   0.000   1.097    32.8    1.44     45.2     87.0      1270    15.8     6.5
+rrtx_fno        env_B  n=3000        2    100% [34,100]    0.00   0.000   1.187    36.0    1.44     25.1     43.7      1329    17.7     2.5
+rrtx_fno        env_C  n=1000        2    100% [34,100]    0.00   0.000   1.066    32.8    1.33     41.8     83.9       985    10.8     6.8
+rrtx_fno        env_C  n=3000        2    100% [34,100]    0.00   0.000   1.051    30.1    1.38     22.3     43.7       960    14.2     2.7
+rrtx_fno        env_D  n=1000        2        0% [0,66]    0.00   0.000      --    13.5    1.48     20.6     79.2      1620    16.5     3.7
+rrtx_fno        env_D  n=3000        2    100% [34,100]    0.00   0.000   1.187    58.3    1.36     24.7     78.8      1016    14.2     4.2
+scramppi_fno    env_A  H=40 N=1000   2    100% [34,100]    0.00   0.000   1.001    39.4    1.71     59.4    620.1       971    10.3    10.2
+scramppi_fno    env_B  H=40 N=1000   2    100% [34,100]    0.00   0.000   1.059    35.4    2.12     64.9    735.2      1244    15.4    13.0
+scramppi_fno    env_C  H=40 N=1000   2    100% [34,100]    0.00   0.000   1.012    31.9    2.50     65.5    776.8       970    10.8    19.2
+scramppi_fno    env_D  H=40 N=1000   2    100% [34,100]    0.00   0.000   1.125    58.6    4.90     71.0   2613.2       978    28.5    16.6
+scramppi_hjr    env_A  H=40 N=1000   2    100% [34,100]    0.00   0.000   1.001    39.4    1.79     56.7    617.0      1752    18.0    10.2
+scramppi_hjr    env_B  H=40 N=1000   2    100% [34,100]    0.00   0.000   1.056    35.2    2.74     59.9    886.7      2059    21.0    20.5
+scramppi_hjr    env_C  H=40 N=1000   2    100% [34,100]    0.00   0.000   1.006    31.6    2.35     62.5    706.3      1971    20.7    16.2
+scramppi_hjr    env_D  H=40 N=1000   2    100% [34,100]    0.00   0.000   1.108    57.9    4.88     66.3   2585.6      1908    28.8    16.1
+
+scored 40 episode(s) -> /home/kmuenpra/git/HJR-FNO-ContingencyPlanning/eval/results/planner_scores/
